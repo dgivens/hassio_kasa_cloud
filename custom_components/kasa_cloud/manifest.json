@@ -1,7 +1,7 @@
 {
   "domain": "kasa_cloud",
   "name": "TP-Link Kasa Cloud",
-  "codeowners": "OnOff Automations",
+  "codeowners": ["OnOff Automations"],
   "config_flow": true,
   "documentation": "https://github.com/onoffautomations/hassio_kasa_cloud",
   "requirements": ["python-kasa>=0.7.0"],
