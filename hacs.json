@@ -1,7 +1,7 @@
 {
   "name": "Kasa Cloud",
   "zip_release": true,
-  "filename": "kasa-cloud.zip",
+  "filename": "kasa_cloud.zip",
   "homeassistant": "2023.8.0",
   "render_readme": true
 }
