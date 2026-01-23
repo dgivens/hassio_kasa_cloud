@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "TP-Link Kasa Cloud Setup",
+        "description": "Enter your TP-Link Kasa cloud credentials to discover and control your devices.",
+        "data": {
+          "username": "Username (Email)",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect. Please check your credentials and network connection.",
+      "no_devices_found": "No devices found in your TP-Link cloud account. This could mean: (1) No devices are registered in your account, (2) You have Tapo devices (not fully supported), or (3) Devices are not properly set up in the Kasa app. Please check the logs for more details."
+    },
+    "abort": {
+      "already_configured": "This account is already configured."
+    }
+  }
+}
