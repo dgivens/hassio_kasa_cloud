@@ -17,10 +17,10 @@ jobs:
 
       - name: Package Kasa Cloud
         run: |
-          cd custom_components/casa-local
+          cd custom_components/kasa_cloud
           zip -r __artifact__.zip .
-          mv __artifact__.zip $GITHUB_WORKSPACE/kasa-cloud.zip
-          echo "ASSET=kasa-cloud.zip" >> $GITHUB_ENV
+          mv __artifact__.zip $GITHUB_WORKSPACE/kasa_cloud.zip
+          echo "ASSET=kasa_cloud.zip" >> $GITHUB_ENV
 
       - name: Upload ZIP Asset
         uses: softprops/action-gh-release@v1
