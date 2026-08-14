@@ -3,10 +3,10 @@
   "name": "TP-Link Kasa Cloud",
   "codeowners": ["@dgivens"],
   "config_flow": true,
-  "documentation": "https://github.com/dgivens/hassio_kasa_cloud",
+  "documentation": "https://git.givens.io/daniel/hassio_kasa_cloud",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/dgivens/hassio_kasa_cloud/issues",
+  "issue_tracker": "https://git.givens.io/daniel/hassio_kasa_cloud/issues",
   "requirements": [],
   "version": "1.1.0"
 }
