@@ -149,6 +149,19 @@ python -m venv .venv
 .venv/bin/pytest
 ```
 
+## License
+
+Contributions in this fork are licensed under [Apache-2.0](LICENSE), matching
+Home Assistant core.
+
+The upstream repository this forks carries **no license**, so the upstream
+author retains all rights to whatever of their work remains. [NOTICE](NOTICE)
+records that in full, along with a reproducible measurement of how much does:
+300 of 1,858 lines are byte-identical to upstream, and of those, 41% are blank
+lines and the rest are almost entirely imports, decorators and method signatures
+that Home Assistant's API dictates. Essentially none of upstream's original
+expression survives, but the position is stated plainly rather than papered over.
+
 ## Disclaimer
 
 Not affiliated with or endorsed by TP-Link. Use at your own risk.

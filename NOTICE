@@ -1,0 +1,95 @@
+TP-Link Kasa Cloud for Home Assistant
+Copyright 2026 Daniel Givens
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+
+PROVENANCE
+----------
+
+This repository is a fork of:
+
+    https://github.com/onoffautomations/hassio_kasa_cloud
+    at commit a568984 (2026-01-23)
+
+That repository contains no license file. It is published publicly, but public
+availability is not a license: absent one, the author retains all rights, and
+the work is not in the public domain.
+
+GitHub's Terms of Service grant every GitHub user the right to view and fork a
+public repository, which is the basis on which this fork exists. Those terms do
+not grant broader rights to modify or redistribute outside GitHub.
+
+
+SCOPE OF THE APACHE-2.0 GRANT
+-----------------------------
+
+The Apache-2.0 license in this repository covers the contributions made in this
+fork. It cannot and does not purport to license whatever remains of the upstream
+author's work, because those rights are not the contributor's to grant. Anyone
+redistributing this repository should understand that the upstream portion, to
+the extent any survives, carries no license from its author.
+
+For the same reason this repository is not offered under GPL: that license
+requires the licensor to be able to license the entire work, which is not the
+case here.
+
+
+HOW MUCH UPSTREAM CODE REMAINS
+------------------------------
+
+Measured at version 2.0.0, comparing custom_components/kasa_cloud against
+upstream commit a568984:
+
+    300 of 1858 lines (16%) are byte-identical to upstream.
+
+Broken down, those 300 lines are:
+
+    124  41%  blank lines
+     89  30%  short fragments (see below)
+     40  13%  import statements dictated by the Home Assistant API
+     15   5%  decorators (@property)
+     12   4%  method signatures required by Home Assistant's platform API
+     11   4%  punctuation and block delimiters
+      5   2%  docstring markers
+      4   1%  module-level constants
+
+The "short fragments" are Home Assistant scaffolding that any integration must
+contain, in the form the framework requires:
+
+    hass: HomeAssistant,
+    async_add_entities: AddEntitiesCallback,
+    ) -> None:
+    def __init__(self, coordinator, device) -> None:
+    async_add_entities(entities)
+    await self.coordinator.async_request_refresh()
+    return True
+
+The only remaining candidates for original expression are the constant
+BASE_URL = "https://wap.tplinkcloud.com", which is a factual endpoint address
+rather than creative expression, and the class name KasaCloudDevice.
+
+Every module was rewritten; coordinator.py, entity.py and the test suite are
+new. CHANGES.md maps each change to the upstream line it replaced.
+
+This measurement is reproducible:
+
+    git remote add upstream https://github.com/onoffautomations/hassio_kasa_cloud
+    git fetch upstream
+    git diff --stat a568984 HEAD -- custom_components/
+
+It is recorded here as a statement of fact about the code, not as a legal
+conclusion. No part of this file is legal advice.
+
+
+THIRD-PARTY ASSETS
+------------------
+
+brands/kasa-mark.svg and the PNGs rendered from it
+(brands/custom_integrations/kasa_cloud/, custom_components/kasa_cloud/brand/)
+are the Kasa Smart mark from Simple Icons (https://simpleicons.org/), which
+publishes its icon set under CC0-1.0. The mark itself is a trademark of TP-Link
+and is reproduced only to identify the service this integration communicates
+with. CC0 covers Simple Icons' reproduction of the mark, not the trademark.
+
+This project is not affiliated with, endorsed by, or supported by TP-Link.
