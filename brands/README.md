@@ -26,22 +26,39 @@ To submit: fork `home-assistant/brands`, copy `custom_integrations/kasa_cloud/`
 into the same path there, and open a pull request. Once merged, the CDN serves
 it and the icon appears after a browser cache refresh.
 
+Only the PNGs belong in a brands submission. `kasa-mark.svg` is kept here as the
+source they were rendered from; do not copy it into the brands repo.
+
+## Regenerating
+
+```bash
+rsvg-convert -w 256 -h 256 -o custom_integrations/kasa_cloud/icon.png    kasa-mark.svg
+rsvg-convert -w 512 -h 512 -o custom_integrations/kasa_cloud/icon@2x.png kasa-mark.svg
+```
+
+Both sizes are rendered natively from vector, so neither is upscaled.
+
 ## Requirements these files satisfy
 
-- PNG only, square 1:1, transparent background, trimmed of empty space
+- PNG only, square 1:1, transparent background, trimmed of empty space (the
+  mark fills its 24x24 viewBox edge to edge, so the render has no margin)
 - `icon.png` exactly 256x256, `icon@2x.png` exactly 512x512
 - Lossless, optimized
 - No Home Assistant branding (the one rule the brands repo enforces strictly,
   since HA branding would imply this is an official integration)
 
-## Known imperfection
+No dark-theme variant is needed: the mark is a single cyan on transparency, and
+its negative space is transparent rather than white, so it reads correctly on
+both light and dark backgrounds.
 
-`icon@2x.png` is upscaled from a 455px source, so it is marginally softer than a
-native 512px render. Replace it from a larger original — ideally the vector
-source — if one becomes available.
+## Provenance
 
-## Note on the mark
+The SVG is the Kasa Smart mark from [Simple Icons](https://simpleicons.org/),
+which publishes its icon set under CC0, filled with Kasa's `#4ACBD6`. That
+colour was verified to match the dominant colour of the vendor's own
+`kasasmart.com/assets/images/logo-mark.png` exactly.
 
-The Kasa logo is TP-Link's trademark, reproduced here to identify which service
-this integration talks to. This is the same convention Home Assistant's own
-`tplink` integration follows.
+The mark itself remains TP-Link's trademark, reproduced to identify which
+service this integration talks to — the same convention Home Assistant's own
+`tplink` integration follows. CC0 covers Simple Icons' reproduction, not the
+trademark.
