@@ -1,59 +1,50 @@
-"""Support for TP-Link Kasa Cloud buttons."""
+"""Button platform for TP-Link Kasa Cloud."""
 from __future__ import annotations
 
-import logging
-
 from homeassistant.components.button import ButtonEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from . import KasaConfigEntry
+from .cloud_api import KasaCloudError
+from .entity import KasaCloudEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 1
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: KasaConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Kasa button devices."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
-
-    entities = []
-    for device in coordinator.data.values():
-        entities.append(KasaRebootButton(coordinator, device))
-
-    async_add_entities(entities)
+    """Set up Kasa button entities."""
+    coordinator = config_entry.runtime_data
+    async_add_entities(
+        KasaRebootButton(coordinator, device) for device in coordinator.data.values()
+    )
 
 
-class KasaRebootButton(CoordinatorEntity, ButtonEntity):
-    """Representation of a Kasa Reboot Button."""
+class KasaRebootButton(KasaCloudEntity, ButtonEntity):
+    """Reboot the device.
+
+    Disabled by default: on a strip this power-cycles every outlet, which is
+    not something to expose one mis-click away on remote hardware.
+    """
+
+    _attr_name = "Reboot"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = False
+    _attr_icon = "mdi:restart"
 
     def __init__(self, coordinator, device) -> None:
-        """Initialize the button."""
-        super().__init__(coordinator)
-        self._device = device
-        self._attr_unique_id = f"{device.device_id}_reboot"
-        self._attr_name = "Reboot"
-        self._attr_has_entity_name = True
-        self._attr_entity_category = EntityCategory.CONFIG
-
-    @property
-    def device_info(self):
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self._device.device_id)},
-            "name": self._device.alias,
-            "manufacturer": "TP-Link",
-            "model": self._device.model,
-            "sw_version": self._device.hw_info.get("sw_ver") if self._device.hw_info else None,
-            "via_device": self.coordinator.hub_id,
-        }
+        super().__init__(coordinator, device, key="reboot")
 
     async def async_press(self) -> None:
-        """Handle the button press."""
-        await self._device.reboot()
+        try:
+            await self._device.reboot()
+        except KasaCloudError as err:
+            raise HomeAssistantError(
+                f"Failed to reboot {self._device.alias or self._device.device_id}: {err}"
+            ) from err

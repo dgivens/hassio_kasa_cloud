@@ -1,10 +1,12 @@
 {
   "domain": "kasa_cloud",
   "name": "TP-Link Kasa Cloud",
-  "codeowners": ["OnOff Automations"],
+  "codeowners": ["@dgivens"],
   "config_flow": true,
-  "documentation": "https://github.com/onoffautomations/hassio_kasa_cloud",
-  "requirements": ["python-kasa>=0.7.0"],
-  "iot_class": "local_polling",
-  "version": "1.0.0"
+  "documentation": "https://github.com/dgivens/hassio_kasa_cloud",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/dgivens/hassio_kasa_cloud/issues",
+  "requirements": [],
+  "version": "1.1.0"
 }

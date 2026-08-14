@@ -1,119 +1,109 @@
 """The TP-Link Kasa Cloud integration."""
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN, CONF_USERNAME, CONF_PASSWORD, UPDATE_INTERVAL
-from .cloud_api import KasaCloudClient, KasaCloudDevice
+from .cloud_api import KasaCloudAuthError, KasaCloudClient, KasaCloudError
+from .const import CONF_TERMINAL_UUID, DOMAIN
+from .coordinator import KasaDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR, Platform.BUTTON, Platform.BINARY_SENSOR]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.LIGHT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
+
+KasaConfigEntry = ConfigEntry[KasaDataUpdateCoordinator]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: KasaConfigEntry) -> bool:
     """Set up TP-Link Kasa Cloud from a config entry."""
-    username = entry.data[CONF_USERNAME]
-    password = entry.data[CONF_PASSWORD]
-
-    # Get devices from TP-Link cloud
-    try:
-        # Get devices from cloud
-        client = KasaCloudClient(username, password)
-        cloud_devices = await client.get_devices()
-    except Exception as err:
-        _LOGGER.error("Failed to get devices from TP-Link cloud: %s", err)
-        return False
-
-    if not cloud_devices:
-        _LOGGER.warning("No Kasa devices found in cloud account")
-        return False
-
-    _LOGGER.info("Found %d device(s) in cloud account", len(cloud_devices))
-
-    # Create coordinator for updates
-    coordinator = KasaDataUpdateCoordinator(
-        hass,
-        devices=cloud_devices,
-        username=username,
-        password=password,
-        entry_id=entry.entry_id,
+    # Reuse Home Assistant's shared session instead of building one per
+    # request, so connections are pooled and closed with HA.
+    client = KasaCloudClient(
+        entry.data[CONF_USERNAME],
+        entry.data[CONF_PASSWORD],
+        async_get_clientsession(hass),
+        terminal_uuid=entry.data.get(CONF_TERMINAL_UUID),
     )
 
-    # Fetch initial data
+    # Persist the terminal UUID so the TP-Link account does not accumulate a
+    # new registered "terminal" on every restart.
+    if not entry.data.get(CONF_TERMINAL_UUID):
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_TERMINAL_UUID: client.terminal_uuid}
+        )
+
+    # Entries created by the upstream version have no unique_id, so the
+    # duplicate check in the config flow would not match them and the same
+    # account could be configured a second time.
+    if entry.unique_id is None:
+        hass.config_entries.async_update_entry(
+            entry, unique_id=entry.data[CONF_USERNAME].strip().lower()
+        )
+
+    try:
+        devices = await client.get_devices()
+    except KasaCloudAuthError as err:
+        # Triggers HA's re-auth card rather than silently dying.
+        raise ConfigEntryAuthFailed(str(err)) from err
+    except KasaCloudError as err:
+        # Retryable: upstream returned False here, which HA never retries, so
+        # a WAN blip during startup disabled the integration until a manual
+        # reload.
+        raise ConfigEntryNotReady(f"Cannot reach TP-Link cloud: {err}") from err
+
+    # A record without a device id cannot be addressed or keyed on.
+    devices = [device for device in devices if device.device_id]
+
+    if not devices:
+        raise ConfigEntryNotReady(
+            "TP-Link cloud returned no usable devices for this account"
+        )
+
+    coordinator = KasaDataUpdateCoordinator(hass, entry, client, devices)
     await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
 
-    # Store coordinator
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
-
-    # Register hub device
     device_registry = dr.async_get(hass)
-    hub_device = device_registry.async_get_or_create(
+    device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, username)},
-        name=f"Kasa Cloud ({username})",
+        identifiers={coordinator.hub_id},
+        name="Kasa Cloud",
         manufacturer="TP-Link",
         model="Kasa Cloud Account",
         entry_type=dr.DeviceEntryType.SERVICE,
     )
 
-    # Setup platforms
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Register the physical devices up front. Platforms are set up
+    # concurrently, so a platform that registers a child outlet with
+    # `via_device` pointing at its strip may otherwise run before the platform
+    # that would have created the strip, leaving the children unlinked.
+    for device in coordinator.data.values():
+        device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, str(device.device_id))},
+            name=device.alias or None,
+            model=device.model or None,
+            manufacturer="TP-Link",
+            via_device=coordinator.hub_id,
+        )
 
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: KasaConfigEntry) -> bool:
     """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
-
-
-class KasaDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching Kasa data."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        devices: list[KasaCloudDevice],
-        username: str,
-        password: str,
-        entry_id: str,
-    ) -> None:
-        """Initialize coordinator."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(seconds=UPDATE_INTERVAL),
-        )
-        self.devices = devices
-        self.username = username
-        self.password = password
-        self.entry_id = entry_id
-        self.hub_id = (DOMAIN, username)
-
-    async def _async_update_data(self) -> dict[str, KasaCloudDevice]:
-        """Update data via library."""
-        try:
-            # Update all devices
-            await asyncio.gather(
-                *[device.update() for device in self.devices],
-                return_exceptions=False,
-            )
-
-            # Return devices indexed by device_id (using host property for compat)
-            return {device.host: device for device in self.devices}
-        except Exception as err:
-            raise UpdateFailed(f"Error communicating with API: {err}") from err
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

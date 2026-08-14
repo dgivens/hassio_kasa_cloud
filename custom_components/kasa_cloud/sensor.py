@@ -1,217 +1,177 @@
-"""Support for TP-Link Kasa sensors."""
+"""Sensor platform for TP-Link Kasa Cloud energy monitoring and diagnostics."""
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
+    SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfEnergy,
     UnitOfPower,
-    EntityCategory,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from . import KasaConfigEntry
+from .entity import KasaCloudEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0  # read-only
+
+
+def _as_float(value: object) -> float | None:
+    """Coerce a cloud-supplied reading, or ``None`` if it is not numeric."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scaled(data: dict, milli_key: str, plain_key: str, digits: int) -> float | None:
+    """Read a value that firmware reports either in milli-units or units."""
+    milli = _as_float(data.get(milli_key))
+    if milli is not None:
+        return round(milli / 1000, digits)
+    plain = _as_float(data.get(plain_key))
+    if plain is not None:
+        return round(plain, digits)
+    return None
+
+
+def _power(device: Any) -> float | None:
+    return _scaled(device.emeter_realtime, "power_mw", "power", 1)
+
+
+def _voltage(device: Any) -> float | None:
+    return _scaled(device.emeter_realtime, "voltage_mv", "voltage", 1)
+
+
+def _current(device: Any) -> float | None:
+    return _scaled(device.emeter_realtime, "current_ma", "current", 3)
+
+
+def _total_energy(device: Any) -> float | None:
+    return _scaled(device.emeter_realtime, "total_wh", "total", 3)
+
+
+@dataclass(frozen=True, kw_only=True)
+class KasaSensorEntityDescription(SensorEntityDescription):
+    """Describes a Kasa cloud sensor."""
+
+    value_fn: Callable[[Any], float | int | None]
+
+
+EMETER_SENSORS: tuple[KasaSensorEntityDescription, ...] = (
+    KasaSensorEntityDescription(
+        key="power",
+        translation_key="current_power",
+        device_class=SensorDeviceClass.POWER,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_power,
+    ),
+    KasaSensorEntityDescription(
+        key="voltage",
+        translation_key="voltage",
+        device_class=SensorDeviceClass.VOLTAGE,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
+        value_fn=_voltage,
+    ),
+    KasaSensorEntityDescription(
+        key="current",
+        translation_key="current",
+        device_class=SensorDeviceClass.CURRENT,
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
+        value_fn=_current,
+    ),
+    KasaSensorEntityDescription(
+        key="total_energy",
+        translation_key="total_energy",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=_total_energy,
+    ),
+)
+
+DIAGNOSTIC_SENSORS: tuple[KasaSensorEntityDescription, ...] = (
+    KasaSensorEntityDescription(
+        key="rssi",
+        translation_key="rssi",
+        device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+        native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=lambda device: device.rssi,
+    ),
+)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: KasaConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Kasa sensor devices."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    """Set up Kasa sensor entities."""
+    coordinator = config_entry.runtime_data
 
-    entities = []
+    entities: list[SensorEntity] = []
     for device in coordinator.data.values():
-        # Check if device has energy monitoring capability
+        if not device.sys_info:
+            continue  # see the note in switch.py
         if device.has_emeter:
-            entities.extend([
-                KasaPowerSensor(coordinator, device),
-                KasaVoltageSensor(coordinator, device),
-                KasaCurrentSensor(coordinator, device),
-                KasaTotalEnergySensor(coordinator, device),
-            ])
+            if device.has_children:
+                # An HS300 meters each outlet separately.
+                for child in device.children:
+                    entities.extend(
+                        KasaSensor(coordinator, child, description, parent=device)
+                        for description in EMETER_SENSORS
+                    )
+            else:
+                entities.extend(
+                    KasaSensor(coordinator, device, description)
+                    for description in EMETER_SENSORS
+                )
 
-        # Diagnostic sensors
-        entities.append(KasaRssiSensor(coordinator, device))
-        entities.append(KasaSignalLevelSensor(coordinator, device))
-        
-        # On Since typically for main relays
-        if device.is_plug or device.is_wall_switch or device.is_strip:
-             entities.append(KasaOnSinceSensor(coordinator, device))
+        entities.extend(
+            KasaSensor(coordinator, device, description)
+            for description in DIAGNOSTIC_SENSORS
+        )
 
     async_add_entities(entities)
 
 
-class KasaSensorBase(CoordinatorEntity, SensorEntity):
-    """Base class for Kasa sensors."""
+class KasaSensor(KasaCloudEntity, SensorEntity):
+    """A Kasa cloud sensor."""
 
-    def __init__(self, coordinator, device, sensor_type: str) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._device = device
-        self._sensor_type = sensor_type
-        self._attr_unique_id = f"{device.device_id or device.host}_{sensor_type}"
-        self._attr_has_entity_name = True
+    entity_description: KasaSensorEntityDescription
+
+    def __init__(self, coordinator, device, description, parent=None) -> None:
+        super().__init__(coordinator, device, key=description.key, parent=parent)
+        self.entity_description = description
 
     @property
-    def device_info(self):
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self._device.device_id or self._device.host)},
-            "name": self._device.alias,
-            "manufacturer": "TP-Link",
-            "model": self._device.model,
-            "sw_version": self._device.hw_info.get("sw_ver") if hasattr(self._device, "hw_info") else None,
-            "via_device": self.coordinator.hub_id,
-        }
+    def native_value(self) -> float | int | None:
+        """Return the reading, or ``None`` when the device has not reported it.
 
-
-class KasaPowerSensor(KasaSensorBase):
-    """Representation of current power consumption."""
-
-    def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator, device, "power")
-        self._attr_name = "Current Power"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_native_unit_of_measurement = UnitOfPower.WATT
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the current power consumption."""
-        try:
-            emeter = self._device.emeter_realtime
-            return emeter.get("power_mw", 0) / 1000 if "power_mw" in emeter else emeter.get("power", 0)
-        except Exception as err:
-            return None
-
-
-class KasaVoltageSensor(KasaSensorBase):
-    """Representation of current voltage."""
-
-    def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator, device, "voltage")
-        self._attr_name = "Voltage"
-        self._attr_device_class = SensorDeviceClass.VOLTAGE
-        self._attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the current voltage."""
-        try:
-            emeter = self._device.emeter_realtime
-            return emeter.get("voltage_mv", 0) / 1000 if "voltage_mv" in emeter else emeter.get("voltage", 0)
-        except Exception as err:
-            return None
-
-
-class KasaCurrentSensor(KasaSensorBase):
-    """Representation of current."""
-
-    def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator, device, "current")
-        self._attr_name = "Current"
-        self._attr_device_class = SensorDeviceClass.CURRENT
-        self._attr_native_unit_of_measurement = UnitOfElectricCurrent.AMPERE
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the current."""
-        try:
-            emeter = self._device.emeter_realtime
-            return emeter.get("current_ma", 0) / 1000 if "current_ma" in emeter else emeter.get("current", 0)
-        except Exception as err:
-            return None
-
-
-class KasaTotalEnergySensor(KasaSensorBase):
-    """Representation of total energy consumption."""
-
-    def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator, device, "total_energy")
-        self._attr_name = "Total Energy"
-        self._attr_device_class = SensorDeviceClass.ENERGY
-        self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-        self._attr_state_class = SensorStateClass.TOTAL_INCREASING
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the total energy consumption."""
-        try:
-            emeter = self._device.emeter_realtime
-            return emeter.get("total", 0)
-        except Exception as err:
-            return None
-
-
-class KasaRssiSensor(KasaSensorBase):
-    """Representation of WiFi signal strength."""
-
-    def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator, device, "rssi")
-        self._attr_name = "WiFi Signal"
-        self._attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
-        self._attr_native_unit_of_measurement = "dBm"
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    @property
-    def native_value(self) -> int | None:
-        """Return the WiFi signal strength."""
-        try:
-            return self._device.rssi
-        except Exception as err:
-            return None
-
-class KasaSignalLevelSensor(KasaSensorBase):
-    """Representation of WiFi signal level (0-3)."""
-    def __init__(self, coordinator, device) -> None:
-        super().__init__(coordinator, device, "signal_level")
-        self._attr_name = "Signal Level"
-        self._attr_device_class = None
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    @property
-    def native_value(self) -> int | None:
-        rssi = self._device.rssi
-        if rssi is None: return None
-        if rssi >= -50: return 3
-        if rssi >= -70: return 2
-        return 1
-
-class KasaOnSinceSensor(KasaSensorBase):
-    """Representation of On Since time."""
-    def __init__(self, coordinator, device) -> None:
-        super().__init__(coordinator, device, "on_since")
-        self._attr_name = "On since"
-        self._attr_device_class = SensorDeviceClass.TIMESTAMP
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    @property
-    def native_value(self):
-        # Time usually returned as seconds on, or similar. Formatting needed.
-        # But user wants "On since". Kasa API sys_info often has `on_time` in seconds.
-        # We need datetime of when it turned on.
-        # For now, just return None or raw if we can't calculate cleanly without robust relative time logic.
-        return None # Placeholder
+        No blanket ``except Exception`` here: upstream used one, which turned a
+        missing ``emeter_realtime`` attribute into four permanently blank
+        sensors that never logged anything.
+        """
+        return self.entity_description.value_fn(self._device)

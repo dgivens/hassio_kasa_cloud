@@ -1,72 +1,115 @@
-"""Config flow for TP-Link Kasa Cloud integration."""
+"""Config flow for the TP-Link Kasa Cloud integration."""
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .cloud_api import KasaCloudAuthError, KasaCloudClient, KasaCloudError
 from .const import DOMAIN
-from .cloud_api import KasaCloudClient
 
 _LOGGER = logging.getLogger(__name__)
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
+        vol.Required(CONF_USERNAME): str,
+        vol.Required(CONF_PASSWORD): str,
     }
 )
 
+STEP_REAUTH_DATA_SCHEMA = vol.Schema({vol.Required(CONF_PASSWORD): str})
 
-class KasaCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+
+class KasaCloudConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for TP-Link Kasa Cloud."""
 
     VERSION = 1
 
+    async def _async_check_credentials(self, username: str, password: str) -> str | None:
+        """Return an error key, or ``None`` when the credentials work.
+
+        Upstream reported every failure as "cannot_connect", so a typo'd
+        password looked like a network problem and every retry was another
+        real login attempt against TP-Link.
+        """
+        client = KasaCloudClient(username, password, async_get_clientsession(self.hass))
+        try:
+            devices = await client.get_devices()
+        except KasaCloudAuthError:
+            return "invalid_auth"
+        except KasaCloudError:
+            return "cannot_connect"
+        except Exception:  # noqa: BLE001 - unexpected, but must not leak a traceback
+            _LOGGER.exception("Unexpected error validating TP-Link cloud credentials")
+            return "unknown"
+        if not devices:
+            return "no_devices_found"
+        return None
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
             username = user_input[CONF_USERNAME]
-            password = user_input[CONF_PASSWORD]
+            # Deliberately outside the error handling below: the AbortFlow this
+            # raises must propagate, not be reported as a connection error.
+            await self.async_set_unique_id(username.strip().lower())
+            self._abort_if_unique_id_configured()
 
-            # Test credentials by retrieving devices from cloud
-            try:
-                client = KasaCloudClient(username, password)
-                devices = await client.get_devices()
-
-                _LOGGER.info("Received devices from cloud: type=%s, value=%s",
-                           type(devices).__name__, devices)
-
-                if not devices or len(devices) == 0:
-                    _LOGGER.warning("No devices found for account %s. Devices value: %s", username, devices)
-                    errors["base"] = "no_devices_found"
-                else:
-                    _LOGGER.info("Found %d devices for account %s", len(devices), username)
-                    # Create a unique ID for this config entry
-                    await self.async_set_unique_id(username)
-                    self._abort_if_unique_id_configured()
-
-                    return self.async_create_entry(
-                        title=f"Kasa Cloud ({username})",
-                        data=user_input,
-                    )
-
-            except Exception as err:
-                _LOGGER.exception("Failed to authenticate with TP-Link cloud: %s", err)
-                errors["base"] = "cannot_connect"
+            error = await self._async_check_credentials(
+                username, user_input[CONF_PASSWORD]
+            )
+            if error is None:
+                return self.async_create_entry(
+                    title=f"Kasa Cloud ({username})", data=user_input
+                )
+            errors["base"] = error
 
         return self.async_show_form(
             step_id="user",
             data_schema=STEP_USER_DATA_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle re-authentication after the cloud rejects our credentials."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Prompt for a new password."""
+        errors: dict[str, str] = {}
+        # Not `assert`: assertions are stripped under `python -O`.
+        entry = self._get_reauth_entry()
+        if entry is None:
+            return self.async_abort(reason="reauth_failed")
+
+        if user_input is not None:
+            error = await self._async_check_credentials(
+                entry.data[CONF_USERNAME], user_input[CONF_PASSWORD]
+            )
+            if error is None:
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data={**entry.data, CONF_PASSWORD: user_input[CONF_PASSWORD]},
+                )
+            errors["base"] = error
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=STEP_REAUTH_DATA_SCHEMA,
+            description_placeholders={"username": entry.data[CONF_USERNAME]},
             errors=errors,
         )

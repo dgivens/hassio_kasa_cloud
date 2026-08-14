@@ -1,60 +1,98 @@
 # TP-Link Kasa Cloud for Home Assistant
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge)](https://github.com/hacs/integration)
+Control TP-Link **Kasa** devices through TP-Link's cloud API, for devices Home
+Assistant cannot reach on the local network — for example a plug or power strip
+at a remote site on someone else's network.
 
-A Home Assistant custom integration to control TP-Link Kasa devices via the official TP-Link Cloud API.
+If your devices *are* reachable locally, use the built-in
+[TP-Link Smart Home integration](https://www.home-assistant.io/integrations/tplink/)
+instead. It is officially maintained, talks to devices locally, and does not
+need your account password. This integration exists only for the remote case.
 
-This integration is particularly useful if:
-- Your devices are on a different subnet or VLAN from your Home Assistant instance.
-- Local discovery is unreliable on your network.
-- You want to control your devices even when local communication is restricted.
+This is a fork of [onoffautomations/hassio_kasa_cloud](https://github.com/onoffautomations/hassio_kasa_cloud)
+with security and correctness fixes. See [CHANGES.md](CHANGES.md) for what
+differs and why.
 
-## Features
-- **Cloud Control**: No need for local network access to the devices.
-- **Auto-Discovery**: Automatically finds all devices linked to your Kasa account.
-- **Multiple Device Types**: Supports Plugs, Switches, Strips, Bulbs, and Dimmers.
-- **Energy Monitoring**: Real-time power usage monitoring (emeter) for supported hardware (e.g., KP115, HS110, EP25).
-- **Motion Sensing**: Supports motion detection status and toggling for ES20M switches.
-- **Device Management**: Includes buttons for rebooting and toggling the device LED.
+## Read this before installing
+
+- **Your TP-Link account password is stored in Home Assistant** in
+  `.storage/core.config_entries`, in cleartext, and is included in every
+  Home Assistant backup. That is how all HA cloud integrations work, but the
+  Kasa cloud API takes the account password directly — there is no scoped
+  token — so a compromise of your HA host or a backup exposes the whole
+  TP-Link account.
+- **Two-step verification is not supported.** The legacy cloud API this uses
+  has no programmatic path for it; login fails with "App version is too old".
+- **This uses TP-Link's legacy ("v1") cloud API, which TP-Link has
+  deprecated.** It works today, but current Kasa app clients use a newer signed
+  API. Expect this to stop working eventually, with no warning.
+- **Nothing here is officially supported by TP-Link**, and the API is
+  undocumented and rate-limited. Devices poll every 60 seconds by default.
+  Lowering that risks your account being throttled or temporarily blocked.
 
 ## Installation
 
-### Method 1: HACS (Recommended)
-1. Ensure [HACS](https://hacs.xyz/) is installed and configured in your Home Assistant.
-2. Go to **HACS** -> **Integrations**.
-3. Click the three dots `...` in the top right corner and select **Custom repositories**.
-4. Paste the URL of this GitHub repository into the **Repository** field.
-5. Select **Integration** in the **Category** dropdown.
-6. Click **Add**.
-7. Click the newly added **TP-Link Kasa Cloud** integration.
-8. Click **Download** and then **Download** again in the popup.
-9. **Restart Home Assistant** to load the integration.
+### HACS (custom repository)
 
-### Method 2: Manual Installation
-1. Download the [latest release](https://github.com/onoffautomations/hassio_kasa_cloud/releases) or the source code.
-2. Copy the `custom_components/kasa_cloud` directory into your Home Assistant's `custom_components` directory.
-3. **Restart Home Assistant**.
+1. HACS → Integrations → ⋮ → Custom repositories
+2. Add `https://github.com/dgivens/hassio_kasa_cloud`, category **Integration**
+3. Install, then restart Home Assistant
 
-## Configuration
-1. In Home Assistant, go to **Settings** -> **Devices & Services**.
-2. Click **Add Integration** in the bottom right.
-3. Search for **TP-Link Kasa Cloud**.
-4. Enter your Kasa/TP-Link username (email) and password.
-5. All compatible devices in your account will be added automatically.
+Installs are made from the repository source, so what runs is what you can read
+here. (Upstream shipped a release ZIP, meaning the installed bytes were a
+separate artifact from the reviewed source.)
 
-## Supported Devices
-The integration attempts to support all Kasa devices that are available via the cloud API.
-- **Plugs & Power Strips**: HS100, HS103, HS105, HS110, KP115, KP303, KP400, etc.
-- **Switches & Dimmers**: HS200, HS210, HS220, ES20M, etc.
-- **Bulbs & Light Strips**: KL110, KL125, KL130, KL430, etc.
+### Manual
 
-*Note: Newer Tapo-branded devices or Matter-only devices might not be fully supported if they use different cloud protocols.*
+Copy `custom_components/kasa_cloud` into your `config/custom_components/`
+directory and restart Home Assistant.
 
-## Troubleshooting
-If you encounter issues:
-- Check the [Home Assistant Logs](https://www.home-assistant.io/docs/configuration/troubleshooting/#checking-the-logs) for any errors regarding `kasa_cloud`.
-- Ensure your credentials are correct and you can log in to the Kasa mobile app.
-- If a device is missing, ensure it is enabled for "Remote Control" in the Kasa app.
+## Setup
 
-## Contributing
-Feel free to open issues or pull requests if you find a bug or have a feature request!
+Settings → Devices & Services → Add Integration → **TP-Link Kasa Cloud**, then
+enter your TP-Link account email and password. Devices in the account are
+discovered automatically. If the password later changes, Home Assistant will
+prompt you to re-authenticate rather than silently failing.
+
+## What you get
+
+| Platform | Entities |
+|---|---|
+| `switch` | One per plug or wall switch; one per outlet on a power strip. Status LED toggle where the device reports one. |
+| `sensor` | Energy monitoring (power, voltage, current, total) on metered hardware — per outlet on an HS300. Wi-Fi signal strength (disabled by default). |
+| `binary_sensor` | Cloud reachability; overheat state where the device reports it. |
+| `button` | Reboot (disabled by default — on a strip it power-cycles every outlet). |
+| `light` | Bulbs and wall dimmers: on/off, brightness, colour temperature, colour. |
+
+Entities are only created for capabilities a device actually reports, so you
+should not see sensors that can never have a value.
+
+### Power strips
+
+An HS300 or KP303 appears as one device per outlet, linked to the strip. Each
+outlet has its own switch, and on the HS300 its own energy sensors. There is
+deliberately no synthetic "all outlets" switch: the hardware has no master
+relay, so such an entity cannot report a truthful state when outlets differ.
+
+## Known limitations
+
+- Tapo devices are not supported. They use a different protocol and will not
+  appear.
+- Cloud polling means state changes made outside Home Assistant take up to
+  60 seconds to appear. There is no push.
+- Energy readings on a strip cost one cloud call per outlet per poll.
+- If the cloud cannot be reached, entities go **unavailable** rather than
+  showing their last known value. This is deliberate: a stale "off" on a
+  remote outlet is worse than an honest "unknown".
+
+## Development
+
+```bash
+python -m venv .venv
+.venv/bin/pip install pytest pytest-asyncio homeassistant
+.venv/bin/pytest
+```
+
+## Disclaimer
+
+Not affiliated with or endorsed by TP-Link. Use at your own risk.

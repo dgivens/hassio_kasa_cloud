@@ -1,407 +1,762 @@
-"""TP-Link Kasa Cloud API Client."""
+"""TP-Link Kasa Cloud API client.
+
+Talks the legacy ("v1") Kasa cloud protocol: an unsigned JSON POST to
+``wap.tplinkcloud.com``, then per-device ``passthrough`` calls in which the
+device command is carried as a JSON *string* in ``requestData``.
+
+Design rules enforced here, because the audited upstream broke all of them:
+
+* Failures raise typed exceptions. Nothing is swallowed and no sentinel dicts
+  are returned, so Home Assistant can tell "offline" from "wrong password".
+* Credentials are re-submitted only on a genuine token expiry, never on a
+  transport error or an offline device. Re-authenticating on every failure
+  turns a flaky link into thousands of login attempts a day.
+* The session token is sent as a header and never interpolated into a URL, so
+  it cannot escape into a log line via an exception string.
+* ``appServerUrl`` arrives in a response body and is therefore untrusted: it
+  is validated against an allowlist before it is ever sent our token.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import json
 import logging
 import uuid
-import json
+
 import aiohttp
+from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://wap.tplinkcloud.com"
 
+# Only hosts under this suffix may receive our session token.
+ALLOWED_HOST_SUFFIX = ".tplinkcloud.com"
+
+# Give up rather than keep submitting credentials that are being refused.
+MAX_CONSECUTIVE_LOGIN_FAILURES = 3
+
+# Reference clients identify as the Android app; a bare "Kasa" is accepted
+# today but is not what any published implementation sends.
+APP_TYPE = "Kasa_Android"
+
+REQUEST_TIMEOUT = 15
+
+ERR_OK = 0
+
+# Token is stale but the credentials are fine: re-login once and retry.
+TOKEN_ERROR_CODES = frozenset({-20651, -20652, -20661, -20675})
+
+# Terminal auth failures. Retrying these locks the account.
+CREDENTIAL_ERROR_CODES = frozenset({-20600, -20601, -20603, -23003})
+
+# Models with a built-in energy meter. Substring matching (the upstream
+# approach) misfires: "KL125" contains "125" but has no meter.
+EMETER_MODEL_PREFIXES = ("HS110", "HS300", "KP115", "KP125", "EP25")
+
+LIGHTING_SERVICE = "smartlife.iot.smartbulb.lightingservice"
+DIMMER_SERVICE = "smartlife.iot.dimmer"
+
+
+class KasaCloudError(Exception):
+    """Base error for all Kasa cloud failures."""
+
+
+class KasaCloudConnectionError(KasaCloudError):
+    """The cloud could not be reached, or returned a transport-level error."""
+
+
+class KasaCloudAuthError(KasaCloudError):
+    """The cloud rejected our credentials. Retrying will not help."""
+
+
+def _decode_alias(value: object) -> str:
+    """Decode a base64 device alias, leaving plain names untouched.
+
+    The cloud returns some aliases base64-encoded (upstream issue #2, where
+    users saw entities named ``RGlzaHdhc2hlcg==`` instead of ``Dishwasher``).
+    A candidate is only accepted if it round-trips exactly and decodes to
+    printable UTF-8, so a plain name that happens to be valid base64 is kept.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return value
+    if base64.b64encode(raw).decode("ascii") != value:
+        return value
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return value
+    if not decoded.strip() or not decoded.isprintable():
+        return value
+    return decoded
+
+
+def _as_int(value: object) -> int | None:
+    """Coerce a cloud-supplied scalar to int, or ``None`` if it is not one.
+
+    Every numeric field here comes from a JSON response body, so a wrong type
+    is a remote input problem, not a programming error. Raising out of an
+    entity property (particularly ``available``) breaks state writes.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_section(result: dict, service: str, method: str) -> dict:
+    """Pull ``service.method`` out of a passthrough's double-encoded reply."""
+    if not isinstance(result, dict):
+        return {}
+    outer = result.get("result")
+    response_data = outer.get("responseData") if isinstance(outer, dict) else None
+    if isinstance(response_data, str):
+        try:
+            response_data = json.loads(response_data)
+        except ValueError as err:
+            raise KasaCloudError("Malformed responseData from TP-Link cloud") from err
+    if not isinstance(response_data, dict):
+        return {}
+    # `or {}` alone is not enough: a truthy non-dict survives it and then
+    # explodes on .get().
+    service_payload = response_data.get(service)
+    if not isinstance(service_payload, dict):
+        return {}
+    section = service_payload.get(method)
+    if not isinstance(section, dict):
+        return {}
+
+    # The envelope's error_code only says the *cloud* accepted the request.
+    # The device reports its own verdict here, so a command can be rejected
+    # inside an otherwise successful response.
+    err_code = section.get("err_code")
+    if err_code not in (None, 0):
+        err_msg = section.get("err_msg")
+        detail = f" {err_msg}" if isinstance(err_msg, str) else ""
+        raise KasaCloudError(
+            f"Device rejected {service}.{method} (err_code={err_code}{detail})"
+        )
+    return section
+
 
 class KasaCloudDevice:
-    """Representation of a Kasa Cloud Device with control capabilities."""
-    def __init__(self, device_info: dict, client: 'KasaCloudClient'):
+    """A device as seen through the Kasa cloud."""
+
+    def __init__(self, device_info: dict, client: KasaCloudClient) -> None:
         self.device_info = device_info
         self.client = client
         self.device_id = device_info.get("deviceId")
-        self.alias = device_info.get("alias")
-        self.device_type = device_info.get("deviceType")
-        self.device_model = device_info.get("deviceModel")
-        self.device_mac = device_info.get("deviceMac")
-        self.hw_id = device_info.get("hwId")
-        self.fw_id = device_info.get("fwId")
-        self.oem_id = device_info.get("oemId")
-        self.app_server_url = device_info.get("appServerUrl")
-        self.device_region = device_info.get("deviceRegion")
-        
-        self.sys_info = {}
-        
-    def get_alias(self):
-        return self.alias
+        self.sys_info: dict = {}
+        self._emeter_realtime: dict = {}
+        self._child_emeter: dict[str, dict] = {}
+
+    # -- identity ---------------------------------------------------------
 
     @property
-    def host(self):
-        """Mock host for compatibility."""
+    def alias(self) -> str:
+        raw = self.sys_info.get("alias") or self.device_info.get("alias") or ""
+        return _decode_alias(raw)
+
+    @property
+    def host(self) -> str | None:
+        """Stable key for this device. Cloud devices have no reachable host."""
         return self.device_id
 
     @property
-    def model(self):
-        """Return device model."""
-        return self.device_model
+    def model(self) -> str:
+        return str(self.device_info.get("deviceModel") or "")
 
     @property
-    def mac(self):
-        """Return device mac."""
-        return self.device_mac
+    def device_type(self) -> str:
+        return str(self.device_info.get("deviceType") or "")
 
     @property
-    def is_plug(self):
-        """Guess if it's a plug."""
-        return "Plug" in self.device_type or "plug" in self.device_type.lower()
+    def mac(self) -> str | None:
+        return self.device_info.get("deviceMac")
 
     @property
-    def is_wall_switch(self):
-        """Guess if it's a switch."""
-        return "Switch" in self.device_type or "switch" in self.device_type.lower()
-        
-    @property
-    def is_strip(self):
-        """Guess if it's a strip."""
-        return "Power Strip" in self.device_type or "strip" in self.device_type.lower() or self.has_children
+    def app_server_url(self) -> str | None:
+        return self.device_info.get("appServerUrl")
 
     @property
-    def is_bulb(self):
-        return "Bulb" in self.device_type or "bulb" in self.device_type.lower() or "IOT.SMARTBULB" in self.device_type
-        
-    @property
-    def is_light_strip(self):
-        return "Light Strip" in self.device_type or "strip" in self.device_type.lower() and self.is_bulb
-        
-    @property
-    def is_dimmable(self):
-        return self.is_bulb or "dimmer" in self.device_type.lower() or "ES20M" in self.model
-        
-    @property
-    def is_variable_color_temp(self):
-        return self.sys_info and "color_temp" in self.sys_info
-        
-    @property
-    def is_color(self):
-        return self.sys_info and "hsv" in self.sys_info
-
-    @property
-    def has_children(self):
-        """Check if device has children plugs."""
-        if self.sys_info and "children" in self.sys_info:
-            return len(self.sys_info["children"]) > 0
-        return False
-
-    @property
-    def children(self):
-        """Return list of child devices."""
-        kids = []
-        if self.has_children:
-            for child in self.sys_info["children"]:
-                kids.append(KasaCloudChildDevice(child, self))
-        return kids
-
-    @property
-    def status(self):
-        """Return online status (1=online, 0=offline)."""
-        return self.device_info.get("status", 1)
-
-    @property
-    def is_on(self):
-        """Check if device is on from cached sys_info."""
-        if not self.sys_info:
-            return False
-        relay_state = self.sys_info.get("relay_state")
-        return relay_state == 1
-
-    @property
-    def brightness(self):
-        """Return brightness 0-255."""
-        if not self.sys_info:
-            return 0
-        # Kasa uses 0-100
-        val = self.sys_info.get("brightness", 0)
-        return int(val * 255 / 100)
-
-    @property
-    def color_temp(self):
-        """Return color temp in Kelvin."""
-        return self.sys_info.get("color_temp", 2700)
-
-    @property
-    def hw_info(self):
-        """Return hardware info."""
+    def hw_info(self) -> dict:
         return {
-            "sw_ver": self.fw_id,
-            "hw_ver": self.hw_id,
+            "sw_ver": self.sys_info.get("sw_ver"),
+            "hw_ver": self.sys_info.get("hw_ver"),
             "mac": self.mac,
             "model": self.model,
         }
 
-    @property
-    def has_emeter(self):
-        """Check if device has emeter."""
-        # Simplified check. "ENE" in feature string usually
-        # But we don't have feature string populated in initial device info often.
-        # Check model names known for emeter: KP115, HS110, KP125, EP25, ES20M
-        model = self.model.upper() if self.model else ""
-        return "110" in model or "115" in model or "125" in model or "25" in model or "ENE" in self.device_info.get("feature", "")
+    # -- capabilities -----------------------------------------------------
 
     @property
-    def rssi(self):
-        """Return RSSI."""
+    def is_bulb(self) -> bool:
+        return "SMARTBULB" in self.device_type.upper() or "light_state" in self.sys_info
+
+    @property
+    def is_plug(self) -> bool:
+        return not self.is_bulb and "SMARTPLUGSWITCH" in self.device_type.upper()
+
+    @property
+    def is_wall_switch(self) -> bool:
+        return self.is_plug and "HS2" in self.model.upper()
+
+    @property
+    def is_strip(self) -> bool:
+        return self.has_children
+
+    @property
+    def is_dimmable(self) -> bool:
+        if self.is_bulb:
+            return True
+        # Wall dimmers report brightness without a light_state block.
+        return "brightness" in self.sys_info
+
+    @property
+    def is_variable_color_temp(self) -> bool:
+        return "color_temp" in self._light_state
+
+    @property
+    def is_color(self) -> bool:
+        return "hue" in self._light_state or "hsv" in self.sys_info
+
+    @property
+    def has_emeter(self) -> bool:
+        # `feature` ("TIM:ENE") is reported by get_sysinfo, not by the cloud's
+        # device list, so sys_info is the authoritative source once polled.
+        feature = self.sys_info.get("feature") or self.device_info.get("feature") or ""
+        if "ENE" in str(feature):
+            return True
+        return self.model.upper().startswith(EMETER_MODEL_PREFIXES)
+
+    @property
+    def has_children(self) -> bool:
+        return bool(self.sys_info.get("children"))
+
+    @property
+    def children(self) -> list[KasaCloudChildDevice]:
+        """Child outlets, resolved live against the most recent poll."""
+        return [
+            KasaCloudChildDevice(self, child["id"])
+            for child in self.sys_info.get("children") or []
+            if child.get("id")
+        ]
+
+    # -- state ------------------------------------------------------------
+
+    @property
+    def _light_state(self) -> dict:
+        state = self.sys_info.get("light_state")
+        return state if isinstance(state, dict) else {}
+
+    @property
+    def is_on(self) -> bool | None:
+        """``None`` when unknown, so HA shows 'unknown' rather than 'off'."""
+        if not self.sys_info:
+            return None
+        if "relay_state" in self.sys_info:
+            return self.sys_info["relay_state"] == 1
+        if "on_off" in self._light_state:
+            return self._light_state["on_off"] == 1
+        return None
+
+    @property
+    def brightness(self) -> int | None:
+        """Brightness on Home Assistant's 0-255 scale."""
+        raw = _as_int(self._light_state.get("brightness", self.sys_info.get("brightness")))
+        if raw is None:
+            return None
+        return round(raw * 255 / 100)
+
+    @property
+    def color_temp(self) -> int | None:
+        """Colour temperature in Kelvin, or ``None`` if unsupported."""
+        raw = _as_int(self._light_state.get("color_temp"))
+        return raw or None
+
+    @property
+    def hsv(self) -> tuple[int, int, int] | None:
+        """Hue, saturation and 0-100 value, or ``None`` if not a colour bulb."""
+        state = self._light_state
+        if "hue" not in state:
+            return None
+        return (
+            _as_int(state.get("hue")) or 0,
+            _as_int(state.get("saturation")) or 0,
+            _as_int(state.get("brightness")) or 0,
+        )
+
+    @property
+    def emeter_realtime(self) -> dict:
+        return self._emeter_realtime
+
+    @property
+    def rssi(self) -> int | None:
         return self.sys_info.get("rssi")
 
     @property
-    def on_since(self):
-        """Return on_since time."""
+    def on_since(self) -> int | None:
         return self.sys_info.get("on_time")
 
     @property
-    def overheated(self):
-        """Return overheat status."""
-        return self.sys_info.get("overheated")
+    def overheated(self) -> bool | None:
+        raw = self.sys_info.get("overheated")
+        if raw is None:
+            return None
+        return bool(raw)
 
-    async def update(self):
-        """Update state from cloud."""
+    @property
+    def led_status(self) -> bool | None:
+        """``True`` when the status LED is lit. ``led_off`` is inverted."""
+        if "led_off" not in self.sys_info:
+            return None
+        return self.sys_info["led_off"] == 0
+
+    @property
+    def status(self) -> int | None:
+        return _as_int(self.device_info.get("status"))
+
+    @property
+    def is_connected(self) -> bool | None:
+        """Cloud-reported reachability, refreshed by the coordinator."""
+        if self.status is None:
+            return None
+        return self.status == 1
+
+    # -- operations -------------------------------------------------------
+
+    async def update(self, include_emeter: bool = True) -> None:
+        """Refresh cached state. Raises so the coordinator can go unavailable."""
         try:
             result = await self.client.passthrough(
-                self.device_id, 
-                {"system": {"get_sysinfo": {}}}, 
-                self.app_server_url
+                self.device_id, {"system": {"get_sysinfo": {}}}, self.app_server_url
             )
-            
-            if result.get("error_code") == 0:
-                response_data = result.get("result", {}).get("responseData")
-                if response_data:
-                    data = json.loads(response_data)
-                    self.sys_info = data.get("system", {}).get("get_sysinfo", {})
-        except Exception as err:
-            _LOGGER.error("Error updating device %s: %s", self.alias, err)
+            sys_info = _payload_section(result, "system", "get_sysinfo")
+        except KasaCloudError:
+            # Never leave stale readings behind to be reported as live.
+            self.sys_info = {}
+            self._emeter_realtime = {}
+            self._child_emeter = {}
+            raise
 
-    async def turn_on(self):
-        """Turn device on."""
-        cmd = {"system": {"set_relay_state": {"state": 1}}}
-        # For bulbs:
-        if self.is_bulb or self.is_dimmable:
-             cmd = {"smartlife.iot.smartbulb.lightingservice": {"transition_light_state": {"on_off": 1}}}
-        
-        await self.client.passthrough(self.device_id, cmd, self.app_server_url)
+        self.sys_info = sys_info
 
-    async def turn_off(self):
-        """Turn device off."""
-        cmd = {"system": {"set_relay_state": {"state": 0}}}
-        if self.is_bulb or self.is_dimmable:
-             cmd = {"smartlife.iot.smartbulb.lightingservice": {"transition_light_state": {"on_off": 0}}}
-        await self.client.passthrough(self.device_id, cmd, self.app_server_url)
+        # Deliberately outside the block above: energy is secondary data, and a
+        # flaky read of it must not discard the state we just fetched
+        # successfully, nor block setup.
+        if include_emeter and self.has_emeter:
+            await self._update_emeter()
 
-    async def set_brightness(self, brightness):
-        """Set brightness (0-100). Home assistant sends 0-255."""
-        kasa_brightness = int(brightness * 100 / 255)
-        cmd = {"smartlife.iot.smartbulb.lightingservice": {"transition_light_state": {"brightness": kasa_brightness, "on_off": 1}}}
-        await self.client.passthrough(self.device_id, cmd, self.app_server_url)
+    async def _update_emeter(self) -> None:
+        """Refresh energy readings. Never raises."""
+        command = {"emeter": {"get_realtime": {}}}
 
-    async def set_color_temp(self, temp):
-        """Set color temp."""
-        cmd = {"smartlife.iot.smartbulb.lightingservice": {"transition_light_state": {"color_temp": temp, "on_off": 1}}}
-        await self.client.passthrough(self.device_id, cmd, self.app_server_url)
+        if self.has_children:
+            readings = dict(self._child_emeter)
+            for child in self.sys_info.get("children") or []:
+                child_id = child.get("id")
+                if not child_id:
+                    continue
+                readings[child_id] = await self._read_emeter(
+                    command, context={"child_ids": [child_id]}
+                )
+            self._child_emeter = readings
+            return
 
-    async def set_hsv(self, h, s, v):
-        """Set HSV."""
-        cmd = {"smartlife.iot.smartbulb.lightingservice": {"transition_light_state": {"hue": h, "saturation": s, "brightness": v, "color_temp": 0, "on_off": 1}}}
-        await self.client.passthrough(self.device_id, cmd, self.app_server_url)
+        self._emeter_realtime = await self._read_emeter(command)
 
-    async def reboot(self):
-        """Reboot the device."""
-        await self.client.passthrough(self.device_id, {"system": {"reboot": {"delay": 1}}}, self.app_server_url)
+    async def _read_emeter(self, command: dict, context: dict | None = None) -> dict:
+        try:
+            result = await self.client.passthrough(
+                self.device_id, command, self.app_server_url, context=context
+            )
+            return _payload_section(result, "emeter", "get_realtime")
+        except KasaCloudError as err:
+            _LOGGER.debug(
+                "Energy read failed for %s%s: %s",
+                self.device_id,
+                f" child {context['child_ids'][0]}" if context else "",
+                err,
+            )
+            return {}
 
-    async def set_led(self, state: bool):
-        """Set LED on/off."""
-        # state True = On, False = Off. Kasa command usually set_led_off 0 (on) or 1 (off)
-        off_value = 0 if state else 1
-        await self.client.passthrough(self.device_id, {"system": {"set_led_off": {"off": off_value}}}, self.app_server_url)
+    async def _send(
+        self, service: str, method: str, args: dict, context: dict | None = None
+    ) -> dict:
+        """Send a command and confirm the device accepted it."""
+        result = await self.client.passthrough(
+            self.device_id, {service: {method: args}}, self.app_server_url, context=context
+        )
+        # Raises if the device reported a non-zero err_code.
+        return _payload_section(result, service, method)
 
-    async def set_motion_detection(self, enabled: bool):
-        """Set motion detection enable/disable."""
-        # Common for ES20M
-        val = 1 if enabled else 0
-        # Try both common services
-        cmd = {"smartlife.iot.smartswitch.motion_switch_service": {"set_config": {"motion_enable": val}}}
-        await self.client.passthrough(self.device_id, cmd, self.app_server_url)
+    async def turn_on(self) -> None:
+        if self.is_bulb:
+            await self._send(LIGHTING_SERVICE, "transition_light_state", {"on_off": 1})
+            return
+        await self._send("system", "set_relay_state", {"state": 1})
 
-    @property
-    def led_status(self):
-        """Return LED status (True=On)."""
-        # led_off: 0 means On, 1 means Off
-        if self.sys_info and "led_off" in self.sys_info:
-             return self.sys_info["led_off"] == 0
-        return True # Default to on
+    async def turn_off(self) -> None:
+        if self.is_bulb:
+            await self._send(LIGHTING_SERVICE, "transition_light_state", {"on_off": 0})
+            return
+        await self._send("system", "set_relay_state", {"state": 0})
 
-    @property
-    def motion_enabled(self):
-        """Return motion detection enabled status."""
-        # Look for motion service config
-        if self.sys_info:
-             # Check for nested service
-             service = self.sys_info.get("smartlife.iot.smartswitch.motion_switch_service")
-             if service and "motion_enable" in service:
-                  return service["motion_enable"] == 1
-             # Check flat
-             if "motion_enable" in self.sys_info:
-                  return self.sys_info["motion_enable"] == 1
-        return False
+    async def set_brightness(self, brightness: int) -> None:
+        """Set brightness from Home Assistant's 0-255 scale."""
+        kasa_pct = max(1, round(int(brightness) * 100 / 255))
+        if self.is_bulb:
+            await self._send(
+                LIGHTING_SERVICE,
+                "transition_light_state",
+                {"brightness": kasa_pct, "on_off": 1},
+            )
+            return
+        # A wall dimmer has no lightingservice; brightness and relay are separate.
+        await self._send("system", "set_relay_state", {"state": 1})
+        await self._send(DIMMER_SERVICE, "set_brightness", {"brightness": kasa_pct})
 
-    @property
-    def is_connected(self):
-        """Return True if connected to cloud."""
-        return self.status == 1
+    async def set_color_temp(self, kelvin: int) -> None:
+        await self._send(
+            LIGHTING_SERVICE,
+            "transition_light_state",
+            {"color_temp": int(kelvin), "on_off": 1},
+        )
+
+    async def set_hsv(self, hue: int, saturation: int, value: int) -> None:
+        await self._send(
+            LIGHTING_SERVICE,
+            "transition_light_state",
+            {
+                "hue": int(hue),
+                "saturation": int(saturation),
+                "brightness": int(value),
+                "color_temp": 0,
+                "on_off": 1,
+            },
+        )
+
+    async def set_led(self, on: bool) -> None:
+        await self._send("system", "set_led_off", {"off": 0 if on else 1})
+
+    async def reboot(self) -> None:
+        await self._send("system", "reboot", {"delay": 1})
 
 
 class KasaCloudChildDevice:
-    """Representation of a child plug (e.g. on a strip)."""
-    def __init__(self, data: dict, parent: KasaCloudDevice):
-        self.data = data
+    """A single outlet on a power strip such as the HS300.
+
+    State is resolved against the parent's current ``sys_info`` on every
+    access. Upstream cached the child's dict at setup time, which the parent
+    then replaced on each poll, freezing every outlet's state permanently.
+    """
+
+    def __init__(self, parent: KasaCloudDevice, child_id: str) -> None:
         self.parent = parent
-        self.device_id = data.get("id")
-        self._id = data.get("id")
-    
-    @property
-    def alias(self):
-        return self.data.get("alias")
-        
-    @property
-    def is_on(self):
-        return self.data.get("state") == 1
-        
-    async def turn_on(self):
-        context = {"child_ids": [self._id]}
-        cmd = {"system": {"set_relay_state": {"state": 1}}}
-        await self.parent.client.passthrough(self.parent.device_id, cmd, self.parent.app_server_url, context=context)
-        
-    async def turn_off(self):
-        context = {"child_ids": [self._id]}
-        cmd = {"system": {"set_relay_state": {"state": 0}}}
-        await self.parent.client.passthrough(self.parent.device_id, cmd, self.parent.app_server_url, context=context)
+        self.device_id = child_id
+        self._id = child_id
 
     @property
-    def device_info(self):
-         info = self.parent.device_info.copy()
-         info["deviceId"] = self._id
-         info["alias"] = self.alias
-         return info
+    def data(self) -> dict:
+        for child in self.parent.sys_info.get("children") or []:
+            if child.get("id") == self._id:
+                return child
+        return {}
 
     @property
-    def model(self):
+    def alias(self) -> str:
+        return _decode_alias(self.data.get("alias") or "")
+
+    @property
+    def is_on(self) -> bool | None:
+        state = self.data.get("state")
+        return None if state is None else state == 1
+
+    @property
+    def device_info(self) -> dict:
+        info = dict(self.parent.device_info)
+        info["deviceId"] = self._id
+        info["alias"] = self.alias
+        return info
+
+    @property
+    def model(self) -> str:
         return self.parent.model
 
     @property
-    def hw_info(self):
-        return {"sw_ver": self.parent.fw_id}
+    def hw_info(self) -> dict:
+        return self.parent.hw_info
 
-    # Child devices on strip usually don't support dimming/color/led control individually
     @property
-    def is_dimmable(self):
+    def has_emeter(self) -> bool:
+        return self.parent.has_emeter
+
+    @property
+    def emeter_realtime(self) -> dict:
+        return self.parent._child_emeter.get(self._id, {})
+
+    @property
+    def on_since(self) -> int | None:
+        return self.data.get("on_time")
+
+    @property
+    def is_connected(self) -> bool | None:
+        return self.parent.is_connected
+
+    @property
+    def is_bulb(self) -> bool:
         return False
-        
+
     @property
-    def is_bulb(self):
+    def is_dimmable(self) -> bool:
         return False
-        
-    @property
-    def is_light_strip(self):
-        return False
-        
-    @property
-    def has_emeter(self):
-        return False # Todo check
+
+    async def _set_relay(self, state: int) -> None:
+        # Routed through the parent's _send so the device's own err_code is
+        # checked; a rejected command must not look like a success.
+        await self.parent._send(
+            "system",
+            "set_relay_state",
+            {"state": state},
+            context={"child_ids": [self._id]},
+        )
+
+    async def turn_on(self) -> None:
+        await self._set_relay(1)
+
+    async def turn_off(self) -> None:
+        await self._set_relay(0)
 
 
 class KasaCloudClient:
-    """Client for TP-Link Kasa Cloud."""
+    """Authenticated client for the Kasa cloud."""
 
-    def __init__(self, username, password):
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        session: aiohttp.ClientSession,
+        terminal_uuid: str | None = None,
+    ) -> None:
         self._username = username
         self._password = password
-        self._token = None
-        self._term_id = str(uuid.uuid4())
+        self._session = session
+        # Stable across restarts when persisted by the caller, so the account
+        # does not accumulate a new "terminal" on every Home Assistant boot.
+        self._terminal_uuid = terminal_uuid or str(uuid.uuid4())
+        self._token: str | None = None
+        # Serialises logins so N devices expiring together cause one login,
+        # not N simultaneous ones with the same credentials.
+        self._login_lock = asyncio.Lock()
+        # Bumped on every successful login, so a caller holding a stale token
+        # can tell whether someone else already refreshed it.
+        self._token_generation = 0
+        self._login_failures = 0
+        self._rejected_hosts: set[str | None] = set()
 
-    async def _call(self, method: str, params: dict = None, url_override: str = None) -> dict:
-        """Make API call to TP-Link cloud."""
-        params = params or {}
-        
-        base = url_override or BASE_URL
-        url = f"{base}?termID={self._term_id}"
-        
-        if self._token:
-            url += f"&token={self._token}"
-        
-        payload = {"method": method, "params": params}
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    response.raise_for_status()
-                    return await response.json()
-            except Exception as e:
-                _LOGGER.error("API call failed: %s", e)
-                return {"error_code": -1, "msg": str(e)}
+    @property
+    def terminal_uuid(self) -> str:
+        return self._terminal_uuid
 
-    async def login(self):
-        """Login to Kasa Cloud."""
-        self._token = None
-        
-        data = await self._call("login", {
-            "appType": "Kasa",
-            "cloudUserName": self._username,
-            "cloudPassword": self._password,
-            "terminalUUID": self._term_id
-        })
-        
-        if data.get("error_code") != 0:
-            raise Exception(f"Login failed: {data}")
-        
-        result = data.get("result", {})
-        self._token = result.get("token")
-        return True
+    def _endpoint(self, url_override: str | None) -> URL:
+        """Resolve the request URL, refusing anything not clearly TP-Link's.
 
-    async def get_devices(self):
-        """Get list of devices from Kasa Cloud."""
-        if not self._token:
-            await self.login()
-            
-        data = await self._call("getDeviceList")
-        
-        if data.get("error_code") != 0:
-            _LOGGER.info("Error getting devices, retrying login: %s", data)
-            await self.login()
-            data = await self._call("getDeviceList")
-            
-            if data.get("error_code") != 0:
-                 raise Exception(f"Get devices failed: {data}")
+        ``appServerUrl`` comes from a response body, so it is attacker- or
+        misconfiguration-controlled. The URL is rebuilt from validated parts
+        rather than passed through: embedded userinfo would otherwise reach
+        aiohttp, which turns it into BasicAuth.
+        """
+        if not url_override:
+            return URL(BASE_URL)
 
-        result = data.get("result", {})
-        device_list = result.get("deviceList", [])
-        
-        return [KasaCloudDevice(d, self) for d in device_list]
+        candidate: URL | None
+        try:
+            candidate = URL(url_override)
+        except (ValueError, TypeError):
+            candidate = None
 
-    async def passthrough(self, device_id: str, command: dict, app_url: str = None, context: dict = None) -> dict:
-        """Send passthrough command to a device."""
-        if not self._token:
-            await self.login()
-            
-        request_data = json.dumps(command)
-        
-        params = {
-            "deviceId": device_id,
-            "requestData": request_data
-        }
-        
-        if context:
-             # In Kasa cloud passthrough, we include context inside the requestData JSON
-             command.update({"context": context})
-             request_data = json.dumps(command)
-             params["requestData"] = request_data
+        host = candidate.host if candidate is not None else None
+        if (
+            candidate is None
+            or candidate.scheme != "https"
+            or not host
+            or not (host == "wap.tplinkcloud.com" or host.endswith(ALLOWED_HOST_SUFFIX))
+            # Credentials in the URL, or a non-standard port, mean this is not
+            # the endpoint we think it is.
+            or candidate.user
+            or candidate.password
+            or candidate.port not in (None, 443)
+        ):
+            if host not in self._rejected_hosts:
+                self._rejected_hosts.add(host)
+                _LOGGER.warning(
+                    "Ignoring untrusted appServerUrl host %r; using %s", host, BASE_URL
+                )
+            return URL(BASE_URL)
 
-        data = await self._call("passthrough", params, url_override=app_url)
-        
-        if data.get("error_code") != 0:
-            _LOGGER.info("Error in passthrough, retrying login: %s", data)
-            await self.login()
-            data = await self._call("passthrough", params, url_override=app_url)
-            
+        # Rebuild from validated components; drops userinfo, query and fragment.
+        return URL.build(scheme="https", host=host, path=candidate.path or "/")
+
+    async def _call(
+        self, method: str, params: dict | None = None, url_override: str | None = None
+    ) -> dict:
+        url = self._endpoint(url_override).with_query({"termID": self._terminal_uuid})
+
+        # The token travels in the JSON body, never in the URL and never in a
+        # header. The v1 API reads it from `params.token`; putting it in the
+        # query string is also accepted but leaks it into every exception
+        # message, proxy log and `ClientResponseError.__str__`.
+        request_params = dict(params or {})
+        if self._token and method != "login":
+            request_params["token"] = self._token
+        payload = {"method": method, "params": request_params}
+
+        try:
+            async with self._session.post(
+                url,
+                json=payload,
+                # A 307/308 replays the request body — which for `login` is the
+                # cleartext password — at a location we never validated, and to
+                # a scheme aiohttp permits downgrading to http.
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as response:
+                if 300 <= response.status < 400:
+                    raise KasaCloudConnectionError(
+                        f"TP-Link cloud attempted a redirect for {method}; refusing"
+                    )
+                response.raise_for_status()
+                return await response.json()
+        except aiohttp.ClientResponseError as err:
+            # `from None`: the original message embeds the request URL.
+            raise KasaCloudConnectionError(
+                f"TP-Link cloud returned HTTP {err.status} for {method}"
+            ) from None
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            # ValueError also covers json.JSONDecodeError and aiohttp.InvalidURL.
+            raise KasaCloudConnectionError(
+                f"Cannot reach TP-Link cloud ({type(err).__name__}) for {method}"
+            ) from None
+
+    def _raise_for_code(
+        self, code: object, what: str, *, credentials_checked: bool = False
+    ) -> None:
+        """Convert an error code to an exception.
+
+        Only a ``login`` reply can tell us the credentials are wrong. Treating
+        a device-level code as a credential failure would stop polling the
+        whole account and prompt for a password that was never wrong.
+        """
+        if credentials_checked and code in CREDENTIAL_ERROR_CODES:
+            raise KasaCloudAuthError(
+                f"TP-Link cloud rejected the account credentials "
+                f"during {what} (error_code={code})"
+            )
+        if code != ERR_OK:
+            raise KasaCloudError(f"{what} failed (error_code={code})")
+
+    async def login(self) -> None:
+        """Authenticate, replacing any existing token."""
+        async with self._login_lock:
+            await self._login_locked()
+
+    async def _login_locked(self) -> None:
+        if self._login_failures >= MAX_CONSECUTIVE_LOGIN_FAILURES:
+            raise KasaCloudAuthError(
+                "Repeated TP-Link cloud login failures; re-authentication required"
+            )
+
+        data = await self._call(
+            "login",
+            {
+                "appType": APP_TYPE,
+                "cloudUserName": self._username,
+                "cloudPassword": self._password,
+                "terminalUUID": self._terminal_uuid,
+            },
+        )
+
+        code = data.get("error_code")
+        if code != ERR_OK:
+            self._login_failures += 1
+            if code in TOKEN_ERROR_CODES:
+                raise KasaCloudAuthError(f"login rejected (error_code={code})")
+            self._raise_for_code(code, "login", credentials_checked=True)
+
+        result = data.get("result")
+        token = result.get("token") if isinstance(result, dict) else None
+        if not token or not isinstance(token, str):
+            self._login_failures += 1
+            raise KasaCloudAuthError("TP-Link cloud login returned no token")
+
+        self._token = token
+        self._token_generation += 1
+        self._login_failures = 0
+
+    async def _ensure_token(self, seen_generation: int | None = None) -> None:
+        """Obtain a token, unless another caller already refreshed it."""
+        async with self._login_lock:
+            if self._token is not None and (
+                seen_generation is None or seen_generation != self._token_generation
+            ):
+                return
+            await self._login_locked()
+
+    async def _call_with_reauth(
+        self,
+        method: str,
+        params: dict | None = None,
+        url_override: str | None = None,
+    ) -> dict:
+        """Call ``method``, re-authenticating at most once on token expiry."""
+        await self._ensure_token()
+        generation = self._token_generation
+
+        data = await self._call(method, params, url_override)
+        if data.get("error_code") in TOKEN_ERROR_CODES:
+            await self._ensure_token(seen_generation=generation)
+            data = await self._call(method, params, url_override)
+
+            if data.get("error_code") in TOKEN_ERROR_CODES:
+                # A freshly issued token was refused, so the token is not being
+                # accepted at all. Retrying can only hammer the login endpoint,
+                # so surface this as an auth failure: Home Assistant then stops
+                # polling and asks the user to reauthenticate.
+                self._token = None
+                raise KasaCloudAuthError(
+                    f"TP-Link cloud refused a freshly issued token for {method} "
+                    f"(error_code={data.get('error_code')})"
+                )
+
+        self._raise_for_code(data.get("error_code"), method)
         return data
+
+    async def fetch_device_records(self) -> list[dict]:
+        """Return the raw ``getDeviceList`` entries."""
+        data = await self._call_with_reauth("getDeviceList")
+        return (data.get("result") or {}).get("deviceList") or []
+
+    async def get_devices(self) -> list[KasaCloudDevice]:
+        return [KasaCloudDevice(record, self) for record in await self.fetch_device_records()]
+
+    async def passthrough(
+        self,
+        device_id: str,
+        command: dict,
+        app_url: str | None = None,
+        context: dict | None = None,
+    ) -> dict:
+        """Send a device command. ``requestData`` must be a JSON *string*."""
+        request = dict(command)
+        if context:
+            request["context"] = context
+        params = {"deviceId": device_id, "requestData": json.dumps(request)}
+        return await self._call_with_reauth("passthrough", params, url_override=app_url)

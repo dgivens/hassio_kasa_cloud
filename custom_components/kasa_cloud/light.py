@@ -1,7 +1,7 @@
-"""Support for TP-Link Kasa smart bulbs."""
+"""Light platform for TP-Link Kasa Cloud bulbs and dimmers."""
 from __future__ import annotations
 
-import logging
+from collections.abc import Coroutine
 from typing import Any
 
 from homeassistant.components.light import (
@@ -11,131 +11,137 @@ from homeassistant.components.light import (
     ColorMode,
     LightEntity,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.util.color import (
-    color_temperature_kelvin_to_mired,
-    color_temperature_mired_to_kelvin,
-)
 
-from .const import DOMAIN
+from . import KasaConfigEntry
+from .cloud_api import KasaCloudError
+from .entity import KasaCloudEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 1
+
+# Conservative defaults; Kasa tunable-white bulbs sit inside this range.
+DEFAULT_MIN_KELVIN = 2500
+DEFAULT_MAX_KELVIN = 6500
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: KasaConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Kasa light devices."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    """Set up Kasa light entities."""
+    coordinator = config_entry.runtime_data
+    async_add_entities(
+        KasaLight(coordinator, device)
+        for device in coordinator.data.values()
+        # Colour capabilities come from sys_info, so skip un-polled devices
+        # rather than freezing them into the wrong set of colour modes.
+        if device.sys_info
+        # A dimmable non-bulb is a wall dimmer; a strip outlet is never a light.
+        and (device.is_bulb or (device.is_dimmable and not device.has_children))
+    )
 
-    entities = []
-    for device in coordinator.data.values():
-        if device.is_bulb or device.is_light_strip or (device.is_dimmable and not device.is_plug):
-            entities.append(KasaLight(coordinator, device))
 
-    async_add_entities(entities)
+class KasaLight(KasaCloudEntity, LightEntity):
+    """A Kasa bulb or wall dimmer."""
 
-
-class KasaLight(CoordinatorEntity, LightEntity):
-    """Representation of a Kasa Smart Light."""
+    _attr_name = None
 
     def __init__(self, coordinator, device) -> None:
-        """Initialize the light."""
-        super().__init__(coordinator)
-        self._device = device
-        self._attr_unique_id = device.device_id or device.host
-        self._attr_name = None # Use device name
-        self._attr_has_entity_name = True
+        super().__init__(coordinator, device)
 
-        # Determine supported color modes
-        self._attr_supported_color_modes = set()
-
-        if device.is_variable_color_temp:
-            self._attr_supported_color_modes.add(ColorMode.COLOR_TEMP)
-
+        modes: set[ColorMode] = set()
         if device.is_color:
-            self._attr_supported_color_modes.add(ColorMode.HS)
+            modes.add(ColorMode.HS)
+        if device.is_variable_color_temp:
+            modes.add(ColorMode.COLOR_TEMP)
+        if not modes:
+            modes.add(
+                ColorMode.BRIGHTNESS if device.is_dimmable else ColorMode.ONOFF
+            )
+        self._attr_supported_color_modes = modes
 
-        if device.is_dimmable and not self._attr_supported_color_modes:
-            self._attr_supported_color_modes.add(ColorMode.BRIGHTNESS)
-
-        if not self._attr_supported_color_modes:
-            self._attr_supported_color_modes.add(ColorMode.ONOFF)
-
-    @property
-    def device_info(self):
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self._device.device_id or self._device.host)},
-            "name": self._device.alias,
-            "manufacturer": "TP-Link",
-            "model": self._device.model,
-            "sw_version": self._device.hw_info.get("sw_ver") if hasattr(self._device, "hw_info") else None,
-            "via_device": self.coordinator.hub_id,
-        }
+        if ColorMode.COLOR_TEMP in modes:
+            self._attr_min_color_temp_kelvin = DEFAULT_MIN_KELVIN
+            self._attr_max_color_temp_kelvin = DEFAULT_MAX_KELVIN
 
     @property
-    def is_on(self) -> bool:
-        """Return true if light is on."""
+    def is_on(self) -> bool | None:
         return self._device.is_on
 
     @property
     def brightness(self) -> int | None:
-        """Return the brightness of this light between 0..255."""
-        if self._device.is_dimmable:
-            return self._device.brightness
-        return None
+        return self._device.brightness
 
     @property
-    def color_temp(self) -> int | None:
-        """Return the color temperature in mireds."""
-        if self._device.is_variable_color_temp:
-            return color_temperature_kelvin_to_mired(self._device.color_temp)
-        return None
+    def color_temp_kelvin(self) -> int | None:
+        """Kelvin, not mireds: the mired properties were removed in HA 2026.3."""
+        return self._device.color_temp
 
     @property
     def hs_color(self) -> tuple[float, float] | None:
-        """Return the hue and saturation color value [float, float]."""
-        if self._device.is_color:
-            hue, saturation, _ = self._device.hsv
-            return hue, saturation
-        return None
+        hsv = self._device.hsv
+        if hsv is None:
+            return None
+        return float(hsv[0]), float(hsv[1])
 
     @property
     def color_mode(self) -> ColorMode | None:
-        """Return the active color mode."""
-        if self._device.is_color:
+        modes = self._attr_supported_color_modes or set()
+        hsv = self._device.hsv
+        if ColorMode.HS in modes and hsv and hsv[1] > 0:
             return ColorMode.HS
-        if self._device.is_variable_color_temp:
+        if ColorMode.COLOR_TEMP in modes and self._device.color_temp:
             return ColorMode.COLOR_TEMP
-        if self._device.is_dimmable:
-            return ColorMode.BRIGHTNESS
-        return ColorMode.ONOFF
+        # Fixed precedence, not set-iteration order, which is not stable
+        # between processes and would flip the rendered attribute on restart.
+        for mode in (
+            ColorMode.COLOR_TEMP,
+            ColorMode.HS,
+            ColorMode.BRIGHTNESS,
+            ColorMode.ONOFF,
+        ):
+            if mode in modes:
+                return mode
+        return None
+
+    async def _async_run(self, action: Coroutine[Any, Any, None]) -> None:
+        try:
+            await action
+        except KasaCloudError as err:
+            raise HomeAssistantError(
+                f"Failed to control {self._device.alias or self._device.device_id}: {err}"
+            ) from err
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn on the light."""
-        if ATTR_BRIGHTNESS in kwargs:
-            brightness_pct = int(kwargs[ATTR_BRIGHTNESS] / 2.55)
-            await self._device.set_brightness(brightness_pct)
-
-        if ATTR_COLOR_TEMP_KELVIN in kwargs:
-            await self._device.set_color_temp(int(kwargs[ATTR_COLOR_TEMP_KELVIN]))
-
+        """Turn on, applying only the attributes actually requested."""
         if ATTR_HS_COLOR in kwargs:
             hue, saturation = kwargs[ATTR_HS_COLOR]
-            # Keep current brightness
-            brightness = self._device.hsv[2] if hasattr(self._device, "hsv") else 100
-            await self._device.set_hsv(int(hue), int(saturation), brightness)
+            brightness = kwargs.get(ATTR_BRIGHTNESS)
+            if brightness is not None:
+                value = round(brightness * 100 / 255)
+            else:
+                current = self._device.hsv
+                value = current[2] if current else 100
+            await self._async_run(self._device.set_hsv(int(hue), int(saturation), value))
+        elif ATTR_COLOR_TEMP_KELVIN in kwargs:
+            await self._async_run(
+                self._device.set_color_temp(int(kwargs[ATTR_COLOR_TEMP_KELVIN]))
+            )
+            if ATTR_BRIGHTNESS in kwargs:
+                await self._async_run(
+                    self._device.set_brightness(kwargs[ATTR_BRIGHTNESS])
+                )
+        elif ATTR_BRIGHTNESS in kwargs:
+            # Passed through on HA's 0-255 scale; set_brightness converts once.
+            await self._async_run(self._device.set_brightness(kwargs[ATTR_BRIGHTNESS]))
+        else:
+            await self._async_run(self._device.turn_on())
 
-        await self._device.turn_on()
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn off the light."""
-        await self._device.turn_off()
+        await self._async_run(self._device.turn_off())
         await self.coordinator.async_request_refresh()

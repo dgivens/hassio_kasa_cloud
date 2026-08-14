@@ -1,132 +1,79 @@
-"""Support for TP-Link Kasa Cloud binary sensors."""
+"""Binary sensor platform for TP-Link Kasa Cloud."""
 from __future__ import annotations
-
-import logging
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from . import KasaConfigEntry
+from .entity import KasaCloudEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0  # read-only
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: KasaConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Kasa binary sensor devices."""
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    """Set up Kasa binary sensor entities."""
+    coordinator = config_entry.runtime_data
 
-    entities = []
+    entities: list[BinarySensorEntity] = []
     for device in coordinator.data.values():
         entities.append(KasaConnectivitySensor(coordinator, device))
-        entities.append(KasaOverheatSensor(coordinator, device))
-        
-        if "ES20M" in device.model or "motion" in device.model.lower():
-             entities.append(KasaMotionSensor(coordinator, device))
+        # Only create this when the device genuinely reports thermal state.
+        # Upstream created it for everything, so plugs with no thermal sensor
+        # showed a confident permanent "OK".
+        if device.overheated is not None:
+            entities.append(KasaOverheatSensor(coordinator, device))
 
     async_add_entities(entities)
 
 
-class KasaConnectivitySensor(CoordinatorEntity, BinarySensorEntity):
-    """Representation of Kasa Connectivity Status."""
+class KasaConnectivitySensor(KasaCloudEntity, BinarySensorEntity):
+    """Whether the cloud can currently reach the device."""
+
+    _attr_name = "Cloud connection"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._device = device
-        self._attr_unique_id = f"{device.device_id}_connectivity"
-        self._attr_name = "Cloud Connection"
-        self._attr_has_entity_name = True
-        self._attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        super().__init__(coordinator, device, key="connectivity")
 
     @property
-    def device_info(self):
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self._device.device_id)},
-            "name": self._device.alias,
-            "manufacturer": "TP-Link",
-            "model": self._device.model,
-            "sw_version": self._device.hw_info.get("sw_ver"),
-            "via_device": self.coordinator.hub_id,
-        }
+    def available(self) -> bool:
+        """Always available while the entry is loaded.
+
+        The base class would mark this unavailable exactly when the device is
+        unreachable — and with a single-device account "one device failed" is
+        also "all devices failed", so the sensor that exists to report an
+        outage would be unavailable for the whole outage.
+        """
+        return True
 
     @property
-    def is_on(self) -> bool:
-        """Return True if connected."""
+    def is_on(self) -> bool | None:
+        # A failed poll is itself the reading: the cloud path is down.
+        if not self.coordinator.last_update_success:
+            return False
         return self._device.is_connected
 
 
-class KasaMotionSensor(CoordinatorEntity, BinarySensorEntity):
-    """Representation of Kasa Motion Sensor."""
+class KasaOverheatSensor(KasaCloudEntity, BinarySensorEntity):
+    """Device-reported overheat state."""
+
+    _attr_name = "Overheated"
+    _attr_device_class = BinarySensorDeviceClass.HEAT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._device = device
-        self._attr_unique_id = f"{device.device_id}_motion"
-        self._attr_name = "Motion"
-        self._attr_has_entity_name = True
-        self._attr_device_class = BinarySensorDeviceClass.MOTION
+        super().__init__(coordinator, device, key="overheat")
 
     @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._device.device_id)},
-            "name": self._device.alias,
-            "manufacturer": "TP-Link",
-            "model": self._device.model,
-            "sw_version": self._device.hw_info.get("sw_ver"),
-            "via_device": self.coordinator.hub_id,
-        }
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if motion detected."""
-        sys_info = self._device.sys_info
-        if not sys_info:
-            return False
-            
-        if "motion_detected" in sys_info:
-            return sys_info["motion_detected"] == 1
-        return False
-        
-class KasaOverheatSensor(CoordinatorEntity, BinarySensorEntity):
-    """Representation of Kasa Overheat Status."""
-
-    def __init__(self, coordinator, device) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._device = device
-        self._attr_unique_id = f"{device.device_id}_overheat"
-        self._attr_name = "Overheated"
-        self._attr_has_entity_name = True
-        self._attr_device_class = BinarySensorDeviceClass.HEAT
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._device.device_id)},
-            "name": self._device.alias,
-            "manufacturer": "TP-Link",
-            "model": self._device.model,
-            "sw_version": self._device.hw_info.get("sw_ver"),
-            "via_device": self.coordinator.hub_id,
-        }
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if overheated."""
-        return self._device.overheated == 1
+    def is_on(self) -> bool | None:
+        return self._device.overheated
