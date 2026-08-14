@@ -31,6 +31,7 @@ KasaCloudClient = cloud_api.KasaCloudClient
 KasaCloudConnectionError = cloud_api.KasaCloudConnectionError
 KasaCloudDevice = cloud_api.KasaCloudDevice
 KasaCloudError = cloud_api.KasaCloudError
+KasaCloudLegacyApiError = cloud_api.KasaCloudLegacyApiError
 
 
 # --------------------------------------------------------------------------
@@ -277,6 +278,43 @@ async def test_bad_credentials_raise_auth_error_and_do_not_retry():
     assert session.methods_called.count("login") == 1
 
 
+async def test_retired_api_is_distinguishable_from_a_bad_password():
+    """-23003 is "App version is too old", not a wrong password.
+
+    v1 returns it for a 2FA-enabled account, and would return it if TP-Link
+    retires the legacy API. Reporting it as a credential failure sends the user
+    hunting for a password problem that does not exist.
+    """
+
+    def handler(url, payload):
+        return FakeResponse(
+            {"error_code": -23003, "msg": "App version is too old"}, url=url
+        )
+
+    client, _ = make_client(handler)
+
+    with pytest.raises(KasaCloudLegacyApiError) as excinfo:
+        await client.login()
+
+    # Still an auth error, so HA stops polling and prompts rather than looping.
+    assert isinstance(excinfo.value, KasaCloudAuthError)
+    message = str(excinfo.value).lower()
+    assert "two-step" in message
+    assert "legacy" in message
+    assert "credential" not in message
+
+
+async def test_plain_bad_password_is_not_reported_as_a_retired_api():
+    def handler(url, payload):
+        return FakeResponse({"error_code": -20601}, url=url)
+
+    client, _ = make_client(handler)
+
+    with pytest.raises(KasaCloudAuthError) as excinfo:
+        await client.login()
+    assert not isinstance(excinfo.value, KasaCloudLegacyApiError)
+
+
 async def test_transport_failure_raises_connection_error():
     def handler(url, payload):
         return FakeResponse({}, status=503, url=url)
@@ -438,9 +476,9 @@ async def test_device_error_code_is_not_mistaken_for_bad_credentials():
     def handler(url, payload):
         if payload["method"] == "login":
             return FakeResponse(LOGIN_OK, url=url)
-        # -23003 is in CREDENTIAL_ERROR_CODES, but arriving here it describes
-        # the device, not the account.
-        return FakeResponse({"error_code": -23003}, url=url)
+        # -20601 is a credential code, but the login that produced our token
+        # already succeeded, so arriving here it cannot mean "wrong password".
+        return FakeResponse({"error_code": -20601}, url=url)
 
     client, _ = make_client(handler)
     device = hs300_device(client)

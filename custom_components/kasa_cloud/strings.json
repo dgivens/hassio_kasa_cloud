@@ -19,7 +19,7 @@
     },
     "error": {
       "cannot_connect": "Could not reach the TP-Link cloud. Check your internet connection and try again.",
-      "invalid_auth": "TP-Link rejected these credentials. Note that two-step verification on your TP-Link account is not supported by this integration.",
+      "invalid_auth": "TP-Link rejected these credentials. If they are definitely correct, check whether two-step verification is enabled on the TP-Link account: the legacy cloud API this integration uses cannot complete a 2FA login, and reports it as an \"app version is too old\" error rather than as a 2FA prompt.",
       "no_devices_found": "No devices found in this TP-Link account. Tapo devices are not supported; only Kasa devices appear here.",
       "unknown": "Unexpected error. Check the Home Assistant log for details."
     },

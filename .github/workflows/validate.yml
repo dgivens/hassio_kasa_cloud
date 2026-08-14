@@ -47,3 +47,59 @@ jobs:
           pip install pytest pytest-asyncio homeassistant
       - name: Run tests
         run: pytest -q
+
+  legacy-api-canary:
+    name: Legacy cloud API still answering
+    # TP-Link has deprecated the v1 API this integration speaks. This is an
+    # early warning that it has been switched off, so a dead remote outlet is
+    # not the first sign. No credentials are involved: a deliberately invalid
+    # login should be rejected, and being rejected proves the API is alive.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Probe wap.tplinkcloud.com
+        run: |
+          set -uo pipefail
+          probe() {
+            curl -sS --max-time 20 -X POST 'https://wap.tplinkcloud.com/' \
+              -H 'Content-Type: application/json' \
+              -d '{"method":"login","params":{"appType":"Kasa_Android",
+                   "cloudUserName":"invalid@example.invalid",
+                   "cloudPassword":"invalid",
+                   "terminalUUID":"00000000-0000-0000-0000-000000000000"}}'
+          }
+
+          # Retry so a transient network blip is not reported as a retirement.
+          for attempt in 1 2 3; do
+            body="$(probe)" && [ -n "$body" ] && break
+            echo "attempt $attempt failed; retrying"
+            sleep 15
+          done
+
+          echo "response: $body"
+
+          if [ -z "$body" ]; then
+            echo "::error::No response from wap.tplinkcloud.com after 3 attempts."
+            exit 1
+          fi
+
+          code="$(printf '%s' "$body" | python3 -c \
+            'import json,sys; print(json.load(sys.stdin).get("error_code","none"))' \
+            2>/dev/null || echo unparseable)"
+
+          case "$code" in
+            -20601)
+              echo "v1 API is alive and rejected the invalid login as expected."
+              ;;
+            -23003)
+              echo "::error::v1 returned -23003 (app version too old). TP-Link may have retired the legacy API."
+              exit 1
+              ;;
+            unparseable)
+              echo "::error::Response was not JSON; the endpoint may no longer serve the v1 API."
+              exit 1
+              ;;
+            *)
+              echo "::warning::Unexpected error_code $code. Not necessarily a retirement, but the v1 contract may have changed."
+              ;;
+          esac

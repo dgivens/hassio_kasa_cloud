@@ -50,7 +50,13 @@ ERR_OK = 0
 TOKEN_ERROR_CODES = frozenset({-20651, -20652, -20661, -20675})
 
 # Terminal auth failures. Retrying these locks the account.
-CREDENTIAL_ERROR_CODES = frozenset({-20600, -20601, -20603, -23003})
+CREDENTIAL_ERROR_CODES = frozenset({-20600, -20601, -20603})
+
+# "App version is too old". The legacy v1 API returns this when it refuses the
+# client outright: for a 2FA-enabled account, and presumably if TP-Link ever
+# retires v1. Reporting it as a wrong password would send the user looking for
+# a problem that is not there.
+LEGACY_API_ERROR_CODES = frozenset({-23003})
 
 # Models with a built-in energy meter. Substring matching (the upstream
 # approach) misfires: "KL125" contains "125" but has no meter.
@@ -81,6 +87,15 @@ class KasaCloudConnectionError(KasaCloudError):
 
 class KasaCloudAuthError(KasaCloudError):
     """The cloud rejected our credentials. Retrying will not help."""
+
+
+class KasaCloudLegacyApiError(KasaCloudAuthError):
+    """The legacy API refused this client outright.
+
+    A subclass of the auth error so Home Assistant still stops polling and
+    prompts rather than looping, but distinguishable so the message can name
+    the actual cause instead of blaming the password.
+    """
 
 
 def _decode_alias(value: object) -> str:
@@ -671,6 +686,16 @@ class KasaCloudClient:
         a device-level code as a credential failure would stop polling the
         whole account and prompt for a password that was never wrong.
         """
+        if code in LEGACY_API_ERROR_CODES:
+            raise KasaCloudLegacyApiError(
+                "TP-Link refused this client during "
+                f"{what} (error_code={code}, \"app version is too old\"). "
+                "The legacy cloud API this integration uses does not support "
+                "two-step verification; if it is enabled on the TP-Link "
+                "account, disable it. Otherwise TP-Link may have retired the "
+                "legacy API, which would need a rewrite against their newer "
+                "signed API."
+            )
         if credentials_checked and code in CREDENTIAL_ERROR_CODES:
             raise KasaCloudAuthError(
                 f"TP-Link cloud rejected the account credentials "

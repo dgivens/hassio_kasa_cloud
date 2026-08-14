@@ -24,8 +24,11 @@ differs and why.
 - **Two-step verification is not supported.** The legacy cloud API this uses
   has no programmatic path for it; login fails with "App version is too old".
 - **This uses TP-Link's legacy ("v1") cloud API, which TP-Link has
-  deprecated.** It works today, but current Kasa app clients use a newer signed
-  API. Expect this to stop working eventually, with no warning.
+  deprecated.** It works today — verified, and its TLS certificate is renewed
+  into late 2026 — but current Kasa app clients use a newer signed API. Expect
+  this to stop working eventually, with no warning. A weekly CI job watches for
+  it, and [docs/v2-migration.md](docs/v2-migration.md) records what a migration
+  would involve and why it is not worth doing pre-emptively.
 - **Nothing here is officially supported by TP-Link**, and the API is
   undocumented and rate-limited. Devices poll every 60 seconds by default.
   Lowering that risks your account being throttled or temporarily blocked.
