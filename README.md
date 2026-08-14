@@ -1,5 +1,15 @@
 # TP-Link Kasa Cloud for Home Assistant
 
+[![Validate](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/validate.yml/badge.svg?branch=main)](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/validate.yml)
+[![v1 cloud API](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/legacy-api.yml/badge.svg?branch=main)](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/legacy-api.yml)
+[![License](https://img.shields.io/github/license/dgivens/hassio_kasa_cloud)](LICENSE)
+
+The **v1 cloud API** badge tracks whether the deprecated TP-Link endpoint this
+integration depends on is still answering. It is checked weekly. If it goes red,
+the integration is likely to stop working — see
+[docs/v2-migration.md](docs/v2-migration.md). It reports on TP-Link's API, not
+on whether this integration is installed correctly.
+
 Control TP-Link **Kasa** devices through TP-Link's cloud API, for devices Home
 Assistant cannot reach on the local network — for example a plug or power strip
 at a remote site on someone else's network.
