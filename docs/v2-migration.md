@@ -25,9 +25,32 @@ A certificate renewed through late 2026 is weak but real evidence that the
 endpoint is being maintained rather than wound down. No sunset date has been
 published anywhere.
 
-The `legacy-api-canary` job in `.github/workflows/validate.yml` re-runs the
-first check weekly and fails if the API stops answering or starts returning
-`-23003`. That is the trigger for this document.
+There was a scheduled CI job doing this check weekly. It was removed: GitHub
+disables scheduled workflows after 60 days of repository inactivity, so on a
+repository maintained occasionally the badge would have kept showing green
+without anything having been checked. A stale pass is worse than no check.
+
+Run it by hand instead — no credentials involved, since being *rejected* is what
+proves the API is alive:
+
+```bash
+curl -s -X POST 'https://wap.tplinkcloud.com/' \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"login","params":{"appType":"Kasa_Android",
+       "cloudUserName":"invalid@example.invalid","cloudPassword":"invalid",
+       "terminalUUID":"00000000-0000-0000-0000-000000000000"}}'
+```
+
+| Response | Meaning |
+|---|---|
+| `-20601` "Incorrect email or password" | v1 is alive and honouring the v1 contract |
+| `-23003` "App version is too old" | v1 may have been retired — this document applies |
+| not JSON, or no response | the endpoint may no longer serve v1 |
+
+In practice the integration itself is the alarm: since `-23003` now raises
+`KasaCloudLegacyApiError`, a retirement surfaces in Home Assistant as a
+re-authentication prompt whose message names the real cause, rather than as a
+generic failure.
 
 ## What v2 requires
 

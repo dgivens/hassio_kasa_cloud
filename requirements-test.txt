@@ -1,0 +1,17 @@
+# Test-only dependencies. The integration itself declares no requirements
+# (manifest.json "requirements": []) — it talks to the cloud with the aiohttp
+# that Home Assistant already ships.
+#
+# Pinned exactly, and tracked by Dependabot, so that a new Home Assistant
+# release arrives as a pull request with CI results attached rather than turning
+# main red without warning.
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+
+# Imported directly by tests/test_cloud_api.py for its exception types.
+aiohttp==3.14.3
+
+# Needed by tests/test_integration_contract.py, which imports every module
+# against real Home Assistant to catch removed or renamed APIs.
+homeassistant==2026.8.1

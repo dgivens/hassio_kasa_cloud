@@ -1,0 +1,44 @@
+version: 2
+
+# Grouped and monthly on purpose. This is a small integration maintained
+# occasionally, so a steady trickle of single-dependency pull requests would go
+# unread — and Dependabot pauses updates when its pull requests are ignored.
+# One batched PR a month is something that can actually be reviewed.
+
+updates:
+  # Keeps the SHA-pinned actions current. Pinning to a SHA is good for supply
+  # chain safety but means an action never receives upstream fixes unless
+  # something bumps it; this is that something.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Test-only dependencies. Dependabot cannot see `pip install` commands inside
+  # a workflow, which is why requirements-test.txt exists as a real manifest.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "test"
+    groups:
+      # Home Assistant on its own: a new release is the most likely thing to
+      # actually break this integration, so it should not be buried in a batch
+      # with pytest bumps.
+      homeassistant:
+        patterns:
+          - "homeassistant"
+      test-tools:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "homeassistant"

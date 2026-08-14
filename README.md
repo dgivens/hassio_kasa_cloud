@@ -1,14 +1,7 @@
 # TP-Link Kasa Cloud for Home Assistant
 
 [![Validate](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/validate.yml/badge.svg?branch=main)](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/validate.yml)
-[![v1 cloud API](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/legacy-api.yml/badge.svg?branch=main)](https://github.com/dgivens/hassio_kasa_cloud/actions/workflows/legacy-api.yml)
 [![License](https://img.shields.io/github/license/dgivens/hassio_kasa_cloud)](LICENSE)
-
-The **v1 cloud API** badge tracks whether the deprecated TP-Link endpoint this
-integration depends on is still answering. It is checked weekly. If it goes red,
-the integration is likely to stop working — see
-[docs/v2-migration.md](docs/v2-migration.md). It reports on TP-Link's API, not
-on whether this integration is installed correctly.
 
 Control TP-Link **Kasa** devices through TP-Link's cloud API, for devices Home
 Assistant cannot reach on the local network — for example a plug or power strip
@@ -36,9 +29,10 @@ differs and why.
 - **This uses TP-Link's legacy ("v1") cloud API, which TP-Link has
   deprecated.** It works today — verified, and its TLS certificate is renewed
   into late 2026 — but current Kasa app clients use a newer signed API. Expect
-  this to stop working eventually, with no warning. A weekly CI job watches for
-  it, and [docs/v2-migration.md](docs/v2-migration.md) records what a migration
-  would involve and why it is not worth doing pre-emptively.
+  this to stop working eventually, with no warning.
+  [docs/v2-migration.md](docs/v2-migration.md) records what a migration would
+  involve, why it is not worth doing pre-emptively, and a one-line command to
+  check whether the endpoint is still answering.
 - **Nothing here is officially supported by TP-Link**, and the API is
   undocumented and rate-limited. Devices poll every 60 seconds by default.
   Lowering that risks your account being throttled or temporarily blocked.
