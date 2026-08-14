@@ -32,32 +32,27 @@ differs and why.
 
 ## Installation
 
-This repository is hosted at
-<https://git.givens.io/daniel/hassio_kasa_cloud>.
+### HACS (custom repository)
+
+1. HACS → Integrations → ⋮ → Custom repositories
+2. Add `https://github.com/dgivens/hassio_kasa_cloud`, category **Integration**
+3. Install, then restart Home Assistant
+
+Installs are made from the repository source, so what runs is what you can read
+here. (Upstream shipped a release ZIP, meaning the installed bytes were a
+separate artifact from the reviewed source.)
 
 ### Manual
 
-Copy the component into your Home Assistant configuration directory and restart:
-
 ```bash
-git clone https://git.givens.io/daniel/hassio_kasa_cloud
+git clone https://github.com/dgivens/hassio_kasa_cloud
 rsync -a hassio_kasa_cloud/custom_components/kasa_cloud/ \
   /path/to/homeassistant/config/custom_components/kasa_cloud/
 ```
 
 Copy only `custom_components/kasa_cloud` — the rest of the repository is tests,
-CI and brand assets that Home Assistant has no use for.
-
-What runs is what you can read here. (Upstream shipped a release ZIP, so the
-installed bytes were a separate artifact from the reviewed source.)
-
-### HACS
-
-Not available from this host. HACS states that
-["only public repositories hosted on GitHub will be compatible with HACS"](https://www.hacs.xyz/docs/faq/other_git_providers/),
-so a Gitea remote cannot be added as a custom repository. Installing through
-HACS would require also publishing a public GitHub mirror and adding *that*
-URL instead.
+CI and brand assets that Home Assistant has no use for. Restart Home Assistant
+afterwards.
 
 ## Setup
 
