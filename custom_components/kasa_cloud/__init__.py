@@ -5,7 +5,7 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -77,14 +77,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: KasaConfigEntry) -> bool
     entry.runtime_data = coordinator
 
     device_registry = dr.async_get(hass)
-    device_registry.async_get_or_create(
-        config_entry_id=entry.entry_id,
-        identifiers={coordinator.hub_id},
-        name="Kasa Cloud",
-        manufacturer="TP-Link",
-        model="Kasa Cloud Account",
-        entry_type=dr.DeviceEntryType.SERVICE,
-    )
 
     # Register the physical devices up front. Platforms are set up
     # concurrently, so a platform that registers a child outlet with
@@ -97,11 +89,49 @@ async def async_setup_entry(hass: HomeAssistant, entry: KasaConfigEntry) -> bool
             name=device.alias or None,
             model=device.model or None,
             manufacturer="TP-Link",
-            via_device=coordinator.hub_id,
         )
+
+    _async_remove_stale_devices(hass, entry, coordinator)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+
+@callback
+def _async_remove_stale_devices(
+    hass: HomeAssistant,
+    entry: KasaConfigEntry,
+    coordinator: KasaDataUpdateCoordinator,
+) -> None:
+    """Drop registry entries this integration no longer creates.
+
+    Covers the entity-less "Kasa Cloud Account" hub device that earlier
+    versions registered, and any device removed from the TP-Link account or
+    since found to be unsupported (a Tapo device or a camera).
+    """
+    if any(not device.sys_info for device in coordinator.data.values()):
+        # Incomplete picture: a device whose poll failed reports no children,
+        # and deleting its outlets would take their history with them.
+        return
+
+    device_registry = dr.async_get(hass)
+
+    current: set[str] = set()
+    for device in coordinator.data.values():
+        current.add(str(device.device_id))
+        current.update(str(child.device_id) for child in device.children)
+
+    for entry_device in dr.async_entries_for_config_entry(
+        device_registry, entry.entry_id
+    ):
+        identifiers = {
+            identifier for domain, identifier in entry_device.identifiers if domain == DOMAIN
+        }
+        if identifiers and not identifiers & current:
+            _LOGGER.debug("Removing stale device %s", entry_device.name)
+            device_registry.async_update_device(
+                entry_device.id, remove_config_entry_id=entry.entry_id
+            )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: KasaConfigEntry) -> bool:

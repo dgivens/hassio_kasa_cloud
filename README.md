@@ -69,15 +69,28 @@ should not see sensors that can never have a value.
 
 ### Power strips
 
-An HS300 or KP303 appears as one device per outlet, linked to the strip. Each
-outlet has its own switch, and on the HS300 its own energy sensors. There is
-deliberately no synthetic "all outlets" switch: the hardware has no master
-relay, so such an entity cannot report a truthful state when outlets differ.
+An HS300 or KP303 appears as the strip itself plus one device per outlet, each
+nested under the strip (visible as "Connected devices" on the strip's page).
+Each outlet has its own switch, and on the HS300 its own energy sensors; the
+strip holds the LED toggle, cloud-connection sensor and reboot button.
+
+This mirrors how Home Assistant's built-in `tplink` integration models the
+HS300, and it is what lets you assign each outlet to a different Area — useful
+when one outlet powers a mount and another a camera. The trade-off is more
+entries in the device list.
+
+There is deliberately no synthetic "all outlets" switch: the hardware has no
+master relay, so such an entity cannot report a truthful state when outlets
+differ. To switch everything at once, target the outlet switches from a script
+or a group.
 
 ## Known limitations
 
-- Tapo devices are not supported. They use a different protocol and will not
-  appear.
+- **Only Kasa plugs, wall switches, dimmers, strips and bulbs appear.** Your
+  TP-Link account may also hold Tapo devices and cameras — the cloud returns
+  them all — but they use a different protocol that this integration cannot
+  drive, so they are filtered out rather than added as devices that could never
+  work.
 - Cloud polling means state changes made outside Home Assistant take up to
   60 seconds to appear. There is no push.
 - Energy readings on a strip cost one cloud call per outlet per poll.

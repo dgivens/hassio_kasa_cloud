@@ -183,6 +183,14 @@ client. *Fix:* `"Kasa_Android"`.
 **Terminal UUID regenerated every restart**, accumulating registered terminals
 on the account. *Fix:* persisted in the config entry.
 
+**Unsupported account devices became broken entities.** `getDeviceList`
+returns every device on the TP-Link account, including Tapo hardware and
+cameras, which speak the newer SMART/KLAP protocol rather than the legacy
+relay/lighting one. Upstream created entities for them anyway; they could never
+work and still cost a cloud call per poll.
+*Fix:* the device list is filtered to `IOT.SMARTPLUGSWITCH` and
+`IOT.SMARTBULB`. Everything else is skipped with a debug line.
+
 ## Removed
 
 - `KasaAutoUpdateSwitch` — `is_on` hardcoded `False`, `turn_on`/`turn_off`
@@ -196,6 +204,11 @@ on the account. *Fix:* persisted in the config entry.
   so it could not report a truthful state, and its `unique_id` embedded a
   display name.
 - Per-request `aiohttp.ClientSession` — replaced with HA's shared session.
+- The "Kasa Cloud Account" hub device. It existed only as a `via_device`
+  anchor, carried no entities, and cluttered the device list. Registry entries
+  this integration no longer creates are now cleaned up on setup — though only
+  when every device polled successfully, so a transient failure cannot delete a
+  strip's outlets along with their history.
 
 ## Added
 

@@ -46,9 +46,6 @@ class KasaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, KasaCloudDevice]
         )
         self.client = client
         self.devices = devices
-        # Keyed on entry_id rather than the account email, to keep the address
-        # out of the device registry.
-        self.hub_id = (DOMAIN, entry.entry_id)
         # Wall-clock based, not cycle-counted: every command triggers an
         # immediate extra refresh, so counting cycles drifts badly.
         self._device_list_at = monotonic()

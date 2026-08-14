@@ -817,6 +817,61 @@ async def test_shared_token_expiry_causes_a_single_relogin():
 
 
 # --------------------------------------------------------------------------
+# The account holds more than this integration can drive
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("device_type", "supported"),
+    [
+        ("IOT.SMARTPLUGSWITCH", True),   # plugs, wall switches, strips, dimmers
+        ("IOT.SMARTBULB", True),
+        ("SMART.TAPOPLUG", False),       # Tapo: different protocol entirely
+        ("SMART.TAPOBULB", False),
+        ("SMART.IPCAMERA", False),       # e.g. a Tapo C325WB
+        ("IOT.IPCAMERA", False),         # Kasa camera: no relay to control
+        ("SMART.KASAPLUG", False),       # newer Kasa hardware on the SMART stack
+        ("", False),
+    ],
+)
+def test_only_controllable_device_types_are_supported(device_type, supported):
+    """getDeviceList returns the whole account, cameras and Tapo included.
+
+    Anything this code cannot actually control must not become a device: it
+    would be permanently unavailable and would still cost a cloud call on
+    every poll.
+    """
+    client, _ = make_client(lambda url, payload: None)
+    device = KasaCloudDevice({"deviceId": "X", "deviceType": device_type}, client)
+
+    assert device.is_supported is supported
+
+
+async def test_unsupported_devices_are_dropped_from_get_devices():
+    def handler(url, payload):
+        if payload["method"] == "login":
+            return FakeResponse(LOGIN_OK, url=url)
+        return FakeResponse(
+            {
+                "error_code": 0,
+                "result": {
+                    "deviceList": [
+                        {"deviceId": "STRIP", "deviceType": "IOT.SMARTPLUGSWITCH"},
+                        {"deviceId": "CAM", "deviceType": "SMART.IPCAMERA"},
+                        {"deviceId": "TAPO", "deviceType": "SMART.TAPOPLUG"},
+                    ]
+                },
+            },
+            url=url,
+        )
+
+    client, _ = make_client(handler)
+
+    devices = await client.get_devices()
+
+    assert [device.device_id for device in devices] == ["STRIP"]
+
+
+# --------------------------------------------------------------------------
 # Robustness against partial cloud payloads
 # --------------------------------------------------------------------------
 

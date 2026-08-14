@@ -63,7 +63,6 @@ class KasaCloudEntity(CoordinatorEntity[KasaDataUpdateCoordinator]):
             mac = getattr(self._device, "mac", None)
             if isinstance(mac, str) and mac:
                 info["connections"] = {(dr.CONNECTION_NETWORK_MAC, dr.format_mac(mac))}
-            info["via_device"] = self.coordinator.hub_id
 
         return info
 

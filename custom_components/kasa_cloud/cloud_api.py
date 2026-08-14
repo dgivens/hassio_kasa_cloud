@@ -59,6 +59,17 @@ EMETER_MODEL_PREFIXES = ("HS110", "HS300", "KP115", "KP125", "EP25")
 LIGHTING_SERVICE = "smartlife.iot.smartbulb.lightingservice"
 DIMMER_SERVICE = "smartlife.iot.dimmer"
 
+# getDeviceList returns every device on the account, including Tapo hardware
+# and cameras. Only these types speak the legacy relay/lighting protocol this
+# client implements; `SMART.*` devices use the newer KLAP/Tapo stack, and
+# cameras have nothing to switch.
+SUPPORTED_DEVICE_TYPES = frozenset(
+    {
+        "IOT.SMARTPLUGSWITCH",  # plugs, wall switches, dimmers, power strips
+        "IOT.SMARTBULB",
+    }
+)
+
 
 class KasaCloudError(Exception):
     """Base error for all Kasa cloud failures."""
@@ -196,6 +207,11 @@ class KasaCloudDevice:
         }
 
     # -- capabilities -----------------------------------------------------
+
+    @property
+    def is_supported(self) -> bool:
+        """Whether this client can actually control the device."""
+        return self.device_type.upper() in SUPPORTED_DEVICE_TYPES
 
     @property
     def is_bulb(self) -> bool:
@@ -745,7 +761,21 @@ class KasaCloudClient:
         return (data.get("result") or {}).get("deviceList") or []
 
     async def get_devices(self) -> list[KasaCloudDevice]:
-        return [KasaCloudDevice(record, self) for record in await self.fetch_device_records()]
+        """Return the devices on the account that this client can control."""
+        devices = [
+            KasaCloudDevice(record, self) for record in await self.fetch_device_records()
+        ]
+
+        supported = [device for device in devices if device.is_supported]
+        for device in devices:
+            if not device.is_supported:
+                _LOGGER.debug(
+                    "Ignoring unsupported device %s (type %r): this integration "
+                    "only handles legacy Kasa plugs, switches and bulbs",
+                    device.device_id,
+                    device.device_type,
+                )
+        return supported
 
     async def passthrough(
         self,
