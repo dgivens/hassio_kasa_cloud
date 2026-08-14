@@ -25,13 +25,8 @@ A certificate renewed through late 2026 is weak but real evidence that the
 endpoint is being maintained rather than wound down. No sunset date has been
 published anywhere.
 
-There was a scheduled CI job doing this check weekly. It was removed: GitHub
-disables scheduled workflows after 60 days of repository inactivity, so on a
-repository maintained occasionally the badge would have kept showing green
-without anything having been checked. A stale pass is worse than no check.
-
-Run it by hand instead — no credentials involved, since being *rejected* is what
-proves the API is alive:
+Re-run that check any time. No credentials are involved, since being *rejected*
+is what proves the API is alive and still honouring the v1 contract:
 
 ```bash
 curl -s -X POST 'https://wap.tplinkcloud.com/' \
