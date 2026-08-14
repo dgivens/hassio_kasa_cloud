@@ -30,6 +30,39 @@ differs and why.
   undocumented and rate-limited. Devices poll every 60 seconds by default.
   Lowering that risks your account being throttled or temporarily blocked.
 
+## How this fork was produced
+
+The audit of the upstream code and the changes in this fork were written with
+[Claude](https://claude.com/claude-code) (Anthropic), directed and reviewed by
+the repository owner. Commits carry `Co-Authored-By: Claude` trailers.
+
+Specifically, that means:
+
+- The upstream code was reviewed for security, correctness and protocol
+  conformance, and the findings were checked against public reverse-engineering
+  of the TP-Link cloud API rather than taken on trust. `CHANGES.md` maps every
+  fix to the upstream line it addresses.
+- The rewrite was reviewed again afterwards by separate agents. That pass caught
+  a real regression — the session token had been moved to an `Authorization`
+  header the API does not read, which would have broken every request — so the
+  process was not merely self-confirming, but it also demonstrates that the
+  first pass shipped a serious mistake.
+- There are 90 automated tests where upstream had none. Each was verified to
+  fail when the bug it covers is reintroduced (23 mutations, all caught), so the
+  suite is known to detect regressions rather than merely passing.
+
+What that does **not** amount to:
+
+- No independent human security audit. If you are installing this, read
+  `custom_components/kasa_cloud/cloud_api.py` yourself — it is the file that
+  handles your credentials, and it is under 800 lines.
+- The tests exercise a fake cloud, not TP-Link's. They prove internal
+  consistency, not that the protocol assumptions are correct. The protocol is
+  undocumented and reverse-engineered.
+- Real-hardware testing covers one HS300 power strip on one account. Bulbs,
+  dimmers, wall switches and single plugs are implemented but unverified against
+  physical devices.
+
 ## Installation
 
 ### HACS (custom repository)
